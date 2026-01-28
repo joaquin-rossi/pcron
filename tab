@@ -1,3 +1,9 @@
 # vim: ft=crontab
-poisson(3600) echo poisson >> /tmp/pcron.log
-uniform(60) echo uniform >> /tmp/pcron.log
+
+poisson(3600) $ echo poisson >> /tmp/pcron.log
+
+uniform(60) $$
+    echo uniform.1 >> /tmp/pcron.log
+    sleep 5
+    echo uniform.2 >> /tmp/pcron.log
+$$

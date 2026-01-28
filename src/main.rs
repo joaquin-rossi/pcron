@@ -64,7 +64,7 @@ async fn main_edit(cli: Cli) {
 }
 
 async fn main_server(cli: Cli) -> ! {
-    let tab = parse_file(&cli.tab).unwrap();
+    let tab = file::read(&cli.tab).unwrap();
 
     for cmd in tab.cmds {
         tokio::spawn(async move {
@@ -77,31 +77,30 @@ async fn main_server(cli: Cli) -> ! {
 }
 
 async fn server_handle_cmd(tab_cmd: TabCmd) -> ! {
-    let script = format!(r#"exec {}"#, tab_cmd.shell);
     let shell = shell_exe();
+    let log_script = tab_cmd.script.lines().next().unwrap().to_string();
 
     loop {
         let sleep_delay = tab_cmd.dist.sample().max(0.0);
-        log_cmd(&tab_cmd.shell, &format!("SLEEP({:.3}s)", sleep_delay));
+        log_cmd(&log_script, &format!("SLEEP({:.3}s)", sleep_delay));
         sleep(Duration::from_secs_f32(sleep_delay)).await;
 
         let mut cmd = Command::new(&shell);
         cmd.arg("-lc");
-        cmd.arg(&script);
+        cmd.arg(&tab_cmd.script);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
-        cmd.status().await.unwrap();
         let mut proc = cmd.spawn().unwrap();
 
         let proc_pid = proc.id().map(|x| x as i32).unwrap_or(-1);
-        log_cmd(&tab_cmd.shell, &format!("CMD_START(pid={})", proc_pid));
+        log_cmd(&log_script, &format!("CMD_START(pid={})", proc_pid));
 
-        let bg_shell = tab_cmd.shell.clone();
+        let bg_log_script = log_script.clone();
         tokio::spawn(async move {
             let proc_status = proc.wait().await.unwrap();
             log_cmd(
-                &bg_shell,
+                &bg_log_script,
                 &format!(
                     "CMD_END(pid={}, exit={})",
                     proc_pid,
@@ -112,7 +111,7 @@ async fn server_handle_cmd(tab_cmd: TabCmd) -> ! {
     }
 }
 
-pub fn log_cmd(cmd: &str, msg: &str) {
+pub fn log_cmd(script: &str, msg: &str) {
     let timestamp = Local::now().format("%b %d %H:%M:%S");
 
     let user = get_user_by_uid(get_current_uid())
@@ -124,5 +123,5 @@ pub fn log_cmd(cmd: &str, msg: &str) {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown-host".to_string());
 
-    println!("{timestamp} {hostname}: ({user}) {msg} ({cmd})");
+    println!("{timestamp} {hostname}: ({user}) {msg} ({script})");
 }

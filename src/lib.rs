@@ -1,7 +1,6 @@
 use rand_distr::Distribution as RandDistribution;
 
-mod parser;
-pub use parser::parse_file;
+pub mod file;
 
 pub struct Tab {
     pub cmds: Vec<TabCmd>,
@@ -9,7 +8,7 @@ pub struct Tab {
 
 pub struct TabCmd {
     pub dist: Box<dyn DistFloat>,
-    pub shell: String,
+    pub script: String,
 }
 
 pub trait DistFloat: Send + Sync {
