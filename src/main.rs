@@ -81,8 +81,8 @@ async fn server_handle_cmd(tab_cmd: TabCmd) -> ! {
     let shell = shell_exe();
 
     loop {
-        let sleep_delay = tab_cmd.dist.sample();
-        log_cmd(&tab_cmd.shell, &format!("SLEEP({}s)", sleep_delay as i32));
+        let sleep_delay = tab_cmd.dist.sample().max(0.0);
+        log_cmd(&tab_cmd.shell, &format!("SLEEP({:.3}s)", sleep_delay));
         sleep(Duration::from_secs_f32(sleep_delay)).await;
 
         let mut cmd = Command::new(&shell);

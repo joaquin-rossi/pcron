@@ -1,2 +1,3 @@
-poisson(10) echo poisson >> /tmp/pcron_poisson.log
-exp(10) echo exp >> /tmp/pcron_exp.log
+# vim: ft=crontab
+poisson(3600) echo poisson >> /tmp/pcron.log
+uniform(60) echo uniform >> /tmp/pcron.log
