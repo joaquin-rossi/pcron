@@ -1,0 +1,2 @@
+poisson(10) echo poisson >> /tmp/pcron_poisson.log
+exp(10) echo exp >> /tmp/pcron_exp.log
