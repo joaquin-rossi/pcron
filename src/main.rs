@@ -1,10 +1,8 @@
 #![cfg(unix)]
 
-use chrono::Local;
 use clap::{Parser, Subcommand};
 use std::{env, path::PathBuf, process::Stdio, time::Duration};
 use tokio::{process::Command, time::sleep};
-use users::{get_current_uid, get_user_by_uid};
 
 use pcron::*;
 
@@ -112,16 +110,14 @@ async fn server_handle_cmd(tab_cmd: TabCmd) -> ! {
 }
 
 pub fn log_cmd(script: &str, msg: &str) {
-    let timestamp = Local::now().format("%b %d %H:%M:%S");
+    let timestamp = chrono::Local::now().format("%b %d %H:%M:%S");
 
-    let user = get_user_by_uid(get_current_uid())
-        .and_then(|u| u.name().to_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| "unknown".to_string());
+    let user = whoami::username().unwrap_or_else(|_| "<unknown-user>".to_string());
 
-    let hostname = hostname::get()
+    let host = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "unknown-host".to_string());
+        .unwrap_or_else(|| "<unknown-host>".to_string());
 
-    println!("{timestamp} {hostname}: ({user}) {msg} ({script})");
+    println!("{timestamp} {host}: ({user}) {msg} ({script})");
 }
