@@ -76,7 +76,12 @@ async fn main_server(cli: Cli) -> ! {
 
 async fn server_handle_cmd(tab_cmd: TabCmd) -> ! {
     let shell = shell_exe();
-    let log_script = tab_cmd.script.lines().next().unwrap().to_string();
+
+    let mut script_lines = tab_cmd.script.lines();
+    let mut log_script = script_lines.next().unwrap().trim().to_string();
+    if let Some(_) = script_lines.next() {
+        log_script.push_str(" ; ...");
+    }
 
     loop {
         let sleep_delay = tab_cmd.dist.sample().max(0.0);
