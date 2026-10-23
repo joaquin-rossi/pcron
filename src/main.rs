@@ -3,15 +3,9 @@ compile_error!("pcron only supports unix");
 
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    time::Duration,
-};
-use tokio::process::Command;
+use std::{env, path::PathBuf, time::Duration};
 
-use pcron::*;
-
+mod edit;
 mod list;
 mod server;
 
@@ -33,6 +27,7 @@ struct Cli {
 enum CliMode {
     /// Show the commands in the tab with statistics of their delays
     List(list::ListArgs),
+    /// Edit a copy of the tab, and install it only if it is valid
     Edit,
     /// Run the commands in the tab (SIGHUP reloads it)
     Server(server::ServerArgs),
@@ -57,7 +52,7 @@ async fn main() -> Result<()> {
         None => default_tab()?,
     };
     match &cli.mode {
-        CliMode::Edit => main_edit(&tab).await,
+        CliMode::Edit => edit::main_edit(&tab).await,
         CliMode::List(args) => list::main_list(&tab, args),
         CliMode::Server(args) => server::main_server(&tab, args).await,
     }
@@ -74,31 +69,6 @@ fn default_tab() -> Result<PathBuf> {
         .or_else(|| absolute("HOME").map(|home| home.join(".config")))
         .context("cannot locate the tab: neither $XDG_CONFIG_HOME nor $HOME is set, use --tab")?;
     Ok(config.join("pcron").join("tab"))
-}
-
-async fn main_edit(tab: &Path) -> Result<()> {
-    let editor = env::var("VISUAL")
-        .or_else(|_| env::var("EDITOR"))
-        .unwrap_or_else(|_| "vim".to_string());
-    if let Some(dir) = tab.parent().filter(|d| !d.as_os_str().is_empty()) {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("cannot create directory {}", dir.display()))?;
-    }
-
-    println!("$ {} {}", editor, tab.display());
-
-    let status = Command::new(SHELL)
-        .arg("-c")
-        .arg(format!(r#"exec {} "$1""#, editor))
-        .arg("sh")
-        .arg(tab)
-        .status()
-        .await
-        .with_context(|| format!("cannot launch editor `{editor}`"))?;
-    ensure!(status.success(), "editor `{editor}` failed: {status}");
-
-    file::read(tab).context("the tab was saved, but it has errors")?;
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
