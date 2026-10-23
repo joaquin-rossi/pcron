@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, fmt, ops::Range};
 
 use nom::{
     IResult, Parser,
@@ -50,6 +50,8 @@ impl fmt::Display for Token {
 pub struct Lexeme {
     pub token: Token,
     pub line: usize,
+    /// byte range in the tab
+    pub span: Range<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -84,6 +86,7 @@ type LexResult<'a, T> = IResult<&'a str, T, LexError<'a>>;
 
 pub fn tokenize(input: &str) -> Result<Vec<Lexeme>, String> {
     let newlines = |from: &str, to: &str| from[..from.len() - to.len()].matches('\n').count();
+    let offset = |rest: &str| input.len() - rest.len();
 
     let mut toks = Vec::new();
     let mut line = 1;
@@ -97,7 +100,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Lexeme>, String> {
 
         match lex_token(rest) {
             Ok((next, token)) => {
-                toks.push(Lexeme { token, line });
+                toks.push(Lexeme {
+                    token,
+                    line,
+                    span: offset(rest)..offset(next),
+                });
                 line += newlines(rest, next);
                 i = next;
             }

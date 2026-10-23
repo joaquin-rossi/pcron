@@ -1,6 +1,6 @@
 # vim: ft=crontab
 
-poisson(60) $ echo poisson >> /tmp/pcron.log
+exp(1/60) $ echo poisson >> /tmp/pcron.log
 
 const(10) $$
     echo uniform.1 >> /tmp/pcron.log

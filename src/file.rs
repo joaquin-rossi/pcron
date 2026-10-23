@@ -24,15 +24,26 @@ pub fn parse(text: &str) -> Result<Tab> {
         .cmds
         .into_iter()
         .map(|cmd| {
-            let dist = cmd
+            let (args, dist) = cmd
                 .expr
                 .args
                 .iter()
                 .map(eval_arg)
                 .collect::<Result<Vec<_>>>()
-                .and_then(|args| build_dyn_dist(&cmd.expr.name, &args))
+                .and_then(|args| {
+                    let dist = build_dyn_dist(&cmd.expr.name, &args)?;
+                    Ok((args, dist))
+                })
                 .with_context(|| format!("line {}: in `{}`", cmd.line, cmd.expr))?;
+            let source = text[cmd.span]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             Ok(TabCmd {
+                line: cmd.line,
+                source,
+                name: cmd.expr.name,
+                args,
                 dist,
                 script: cmd.script,
             })

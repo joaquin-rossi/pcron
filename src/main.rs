@@ -15,6 +15,8 @@ use tokio::{process::Command, task::JoinSet, time::sleep};
 
 use pcron::*;
 
+mod list;
+
 // scripts and the editor always run with sh, whatever the user's $SHELL is
 const SHELL: &str = "/bin/sh";
 
@@ -31,13 +33,14 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum CliMode {
-    List,
+    /// Show the commands in the tab with statistics of their delays
+    List(list::ListArgs),
     Edit,
-    Server(ServerArgs),
+    Server(DelayArgs),
 }
 
 #[derive(Args, Debug)]
-struct ServerArgs {
+struct DelayArgs {
     /// Lower bound for every sampled delay, in seconds
     #[arg(long, env = "PCRON_MIN_DELAY", default_value_t = 1.0)]
     min_delay: f64,
@@ -56,7 +59,7 @@ async fn main() -> Result<()> {
     };
     match &cli.mode {
         CliMode::Edit => main_edit(&tab).await,
-        CliMode::List => main_list(&tab),
+        CliMode::List(args) => list::main_list(&tab, args),
         CliMode::Server(args) => main_server(&tab, args).await,
     }
 }
@@ -72,13 +75,6 @@ fn default_tab() -> Result<PathBuf> {
         .or_else(|| absolute("HOME").map(|home| home.join(".config")))
         .context("cannot locate the tab: neither $XDG_CONFIG_HOME nor $HOME is set, use --tab")?;
     Ok(config.join("pcron").join("tab"))
-}
-
-fn main_list(tab: &Path) -> Result<()> {
-    let tab_text =
-        fs::read_to_string(tab).with_context(|| format!("cannot read tab {}", tab.display()))?;
-    print!("{}", tab_text);
-    Ok(())
 }
 
 async fn main_edit(tab: &Path) -> Result<()> {
@@ -125,19 +121,26 @@ impl DelayBounds {
         Ok(Self { min, max })
     }
 
-    fn delay(self, secs: f64) -> Duration {
+    fn new_from_args(args: &DelayArgs) -> Result<Self> {
+        Self::new(args.min_delay, args.max_delay)
+    }
+
+    fn clamp(self, secs: f64) -> f64 {
         // clamp lets NaN through
-        let secs = if secs.is_nan() {
+        if secs.is_nan() {
             self.max
         } else {
             secs.clamp(self.min, self.max)
-        };
-        Duration::from_secs_f64(secs)
+        }
+    }
+
+    fn delay(self, secs: f64) -> Duration {
+        Duration::from_secs_f64(self.clamp(secs))
     }
 }
 
-async fn main_server(tab_path: &Path, args: &ServerArgs) -> Result<()> {
-    let bounds = DelayBounds::new(args.min_delay, args.max_delay)?;
+async fn main_server(tab_path: &Path, args: &DelayArgs) -> Result<()> {
+    let bounds = DelayBounds::new_from_args(args)?;
     let tab = file::read(tab_path)?;
     ensure!(
         !tab.cmds.is_empty(),

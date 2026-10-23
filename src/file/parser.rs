@@ -1,5 +1,5 @@
 use crate::file::lexer::{Lexeme, Token};
-use std::fmt;
+use std::{fmt, ops::Range};
 
 #[derive(Debug)]
 pub struct File {
@@ -9,6 +9,8 @@ pub struct File {
 #[derive(Debug)]
 pub struct Command {
     pub line: usize,
+    /// byte range of the distribution in the tab
+    pub span: Range<usize>,
     pub expr: DistExpr,
     pub script: String,
 }
@@ -126,6 +128,7 @@ impl<'a> Parser<'a> {
     // Cmd := IDENT '(' Args ')' SCRIPT
     fn cmd(&mut self) -> Result<Command, String> {
         let line = self.line();
+        let start = self.input[self.pos].span.start;
         let Some(Token::Ident(name)) = self.peek() else {
             return self.error("a distribution name");
         };
@@ -134,6 +137,7 @@ impl<'a> Parser<'a> {
         self.expect(&Token::ParenLeft, &format!("`(` after `{name}`"))?;
         let args = self.args()?;
         self.expect(&Token::ParenRight, "`,` or `)`")?;
+        let span = start..self.input[self.pos - 1].span.end;
         let expr = DistExpr {
             name: name.clone(),
             args,
@@ -148,6 +152,7 @@ impl<'a> Parser<'a> {
 
         Ok(Command {
             line,
+            span,
             expr,
             script: script.clone(),
         })
