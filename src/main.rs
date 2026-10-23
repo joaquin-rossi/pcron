@@ -4,10 +4,10 @@ compile_error!("pcron only supports unix");
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use std::{
-    env,
+    env, fs,
     io::{self, Write},
     os::unix::process::ExitStatusExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     time::Duration,
 };
@@ -15,11 +15,15 @@ use tokio::{process::Command, task::JoinSet, time::sleep};
 
 use pcron::*;
 
+// scripts and the editor always run with sh, whatever the user's $SHELL is
+const SHELL: &str = "/bin/sh";
+
 #[derive(Debug, Parser)]
 #[command(about, author, version)]
 struct Cli {
-    #[arg(long, env = "PCRON_TAB", default_value = "./tab")]
-    tab: PathBuf,
+    /// Path to the tab [default: $XDG_CONFIG_HOME/pcron/tab]
+    #[arg(long, env = "PCRON_TAB")]
+    tab: Option<PathBuf>,
 
     #[command(subcommand)]
     mode: CliMode,
@@ -46,42 +50,59 @@ struct ServerArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let tab = match cli.tab {
+        Some(tab) => tab,
+        None => default_tab()?,
+    };
     match &cli.mode {
-        CliMode::Edit => main_edit(&cli).await,
-        CliMode::List => main_list(&cli),
-        CliMode::Server(args) => main_server(&cli, args).await,
+        CliMode::Edit => main_edit(&tab).await,
+        CliMode::List => main_list(&tab),
+        CliMode::Server(args) => main_server(&tab, args).await,
     }
 }
 
-fn main_list(cli: &Cli) -> Result<()> {
-    let tab_text = std::fs::read_to_string(&cli.tab)
-        .with_context(|| format!("cannot read tab {}", cli.tab.display()))?;
+// $XDG_CONFIG_HOME/pcron/tab, falling back to ~/.config/pcron/tab
+fn default_tab() -> Result<PathBuf> {
+    let absolute = |var| {
+        env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let config = absolute("XDG_CONFIG_HOME")
+        .or_else(|| absolute("HOME").map(|home| home.join(".config")))
+        .context("cannot locate the tab: neither $XDG_CONFIG_HOME nor $HOME is set, use --tab")?;
+    Ok(config.join("pcron").join("tab"))
+}
+
+fn main_list(tab: &Path) -> Result<()> {
+    let tab_text =
+        fs::read_to_string(tab).with_context(|| format!("cannot read tab {}", tab.display()))?;
     print!("{}", tab_text);
     Ok(())
 }
 
-fn shell_exe() -> String {
-    env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
-}
-
-async fn main_edit(cli: &Cli) -> Result<()> {
+async fn main_edit(tab: &Path) -> Result<()> {
     let editor = env::var("VISUAL")
         .or_else(|_| env::var("EDITOR"))
         .unwrap_or_else(|_| "vim".to_string());
-    println!("$ {} {}", editor, cli.tab.display());
+    if let Some(dir) = tab.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("cannot create directory {}", dir.display()))?;
+    }
 
-    // /bin/sh and not $SHELL: the snippet below is POSIX sh syntax
-    let status = Command::new("/bin/sh")
+    println!("$ {} {}", editor, tab.display());
+
+    let status = Command::new(SHELL)
         .arg("-c")
         .arg(format!(r#"exec {} "$1""#, editor))
         .arg("sh")
-        .arg(&cli.tab)
+        .arg(tab)
         .status()
         .await
         .with_context(|| format!("cannot launch editor `{editor}`"))?;
     ensure!(status.success(), "editor `{editor}` failed: {status}");
 
-    file::read(&cli.tab).context("the tab was saved, but it has errors")?;
+    file::read(tab).context("the tab was saved, but it has errors")?;
     Ok(())
 }
 
@@ -104,8 +125,7 @@ impl DelayBounds {
         Ok(Self { min, max })
     }
 
-    fn delay(self, sample: f32) -> Duration {
-        let secs = f64::from(sample);
+    fn delay(self, secs: f64) -> Duration {
         // clamp lets NaN through
         let secs = if secs.is_nan() {
             self.max
@@ -116,13 +136,13 @@ impl DelayBounds {
     }
 }
 
-async fn main_server(cli: &Cli, args: &ServerArgs) -> Result<()> {
+async fn main_server(tab_path: &Path, args: &ServerArgs) -> Result<()> {
     let bounds = DelayBounds::new(args.min_delay, args.max_delay)?;
-    let tab = file::read(&cli.tab)?;
+    let tab = file::read(tab_path)?;
     ensure!(
         !tab.cmds.is_empty(),
         "tab {} has no commands",
-        cli.tab.display()
+        tab_path.display()
     );
 
     let mut tasks = JoinSet::new();
@@ -138,8 +158,6 @@ async fn main_server(cli: &Cli, args: &ServerArgs) -> Result<()> {
 }
 
 async fn server_handle_cmd(tab_cmd: TabCmd, bounds: DelayBounds) -> ! {
-    let shell = shell_exe();
-
     let mut script_lines = tab_cmd.script.lines();
     let mut log_script = script_lines.next().unwrap_or_default().trim().to_string();
     if script_lines.next().is_some() {
@@ -154,7 +172,7 @@ async fn server_handle_cmd(tab_cmd: TabCmd, bounds: DelayBounds) -> ! {
         );
         sleep(sleep_delay).await;
 
-        let mut cmd = Command::new(&shell);
+        let mut cmd = Command::new(SHELL);
         cmd.arg("-lc");
         cmd.arg(&tab_cmd.script);
         cmd.stdin(Stdio::null());
@@ -165,7 +183,7 @@ async fn server_handle_cmd(tab_cmd: TabCmd, bounds: DelayBounds) -> ! {
             Err(e) => {
                 log_cmd(
                     &log_script,
-                    &format!("CMD_ERROR(cannot spawn `{shell}`: {e})"),
+                    &format!("CMD_ERROR(cannot spawn `{SHELL}`: {e})"),
                 );
                 continue;
             }
@@ -222,8 +240,8 @@ mod tests {
         assert_eq!(b.delay(-5.0), Duration::from_secs(1));
         assert_eq!(b.delay(0.0), Duration::from_secs(1));
         assert_eq!(b.delay(30.0), Duration::from_secs(30));
-        assert_eq!(b.delay(f32::INFINITY), Duration::from_secs(60));
-        assert_eq!(b.delay(f32::NAN), Duration::from_secs(60));
+        assert_eq!(b.delay(f64::INFINITY), Duration::from_secs(60));
+        assert_eq!(b.delay(f64::NAN), Duration::from_secs(60));
     }
 
     #[test]

@@ -12,15 +12,15 @@ pub struct TabCmd {
 }
 
 pub trait DistFloat: Send + Sync {
-    fn sample(&self) -> f32;
+    fn sample(&self) -> f64;
 }
 
 impl<D> DistFloat for D
 where
-    D: RandDistribution<f32> + Send + Sync,
+    D: RandDistribution<f64> + Send + Sync,
 {
     #[inline]
-    fn sample(&self) -> f32 {
+    fn sample(&self) -> f64 {
         RandDistribution::sample(self, &mut rand::rng())
     }
 }

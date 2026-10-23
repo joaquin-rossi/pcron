@@ -5,6 +5,8 @@ use crate::{DistFloat, Tab, TabCmd};
 use parser::{BinOp, Expr};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use rand::Rng;
+use rand_distr::Distribution;
 use std::{fs, path::Path};
 
 pub fn read(path: impl AsRef<Path>) -> Result<Tab> {
@@ -28,7 +30,7 @@ pub fn parse(text: &str) -> Result<Tab> {
                 .iter()
                 .map(eval_arg)
                 .collect::<Result<Vec<_>>>()
-                .and_then(|args| build_dyn_distf32(&cmd.expr.name, &args))
+                .and_then(|args| build_dyn_dist(&cmd.expr.name, &args))
                 .with_context(|| format!("line {}: in `{}`", cmd.line, cmd.expr))?;
             Ok(TabCmd {
                 dist,
@@ -40,12 +42,10 @@ pub fn parse(text: &str) -> Result<Tab> {
     Ok(Tab { cmds })
 }
 
-// arguments are evaluated as f64 and must end up finite and non-negative
-fn eval_arg(e: &Expr) -> Result<f32> {
+// arguments must end up non-negative (eval already rejects non-finite values)
+fn eval_arg(e: &Expr) -> Result<f64> {
     let v = eval(e)?;
     ensure!(v >= 0.0, "`{e}` is negative ({v})");
-    let v = v as f32;
-    ensure!(v.is_finite(), "`{e}` is too large");
     Ok(v)
 }
 
@@ -71,6 +71,7 @@ fn eval(e: &Expr) -> Result<f64> {
 
 // - beta(alpha, beta)
 // - cauchy(median, scale)
+// - const(value)
 // - chi_squared(k)
 // - exp(lambda)
 // - exp1()
@@ -90,9 +91,18 @@ fn eval(e: &Expr) -> Result<f64> {
 // - standard_uniform()
 // - student_t(nu)
 // - triangular(min, max, mode)
-// - uniform(a [, b])
+// - uniform(min, max)
 // - weibull(scale, shape)
-pub fn build_dyn_distf32(name: &str, a: &[f32]) -> Result<Box<dyn DistFloat>> {
+// always samples the same value
+struct Const(f64);
+
+impl Distribution<f64> for Const {
+    fn sample<R: Rng + ?Sized>(&self, _: &mut R) -> f64 {
+        self.0
+    }
+}
+
+pub fn build_dyn_dist(name: &str, a: &[f64]) -> Result<Box<dyn DistFloat>> {
     let expect = |n: usize| {
         if a.len() == n {
             Ok(())
@@ -110,6 +120,10 @@ pub fn build_dyn_distf32(name: &str, a: &[f32]) -> Result<Box<dyn DistFloat>> {
         "beta" => {
             expect(2)?;
             Box::new(Beta::new(a[0], a[1])?)
+        }
+        "const" => {
+            expect(1)?;
+            Box::new(Const(a[0]))
         }
         "cauchy" => {
             expect(2)?;
@@ -192,9 +206,9 @@ pub fn build_dyn_distf32(name: &str, a: &[f32]) -> Result<Box<dyn DistFloat>> {
             Box::new(Triangular::new(a[0], a[1], a[2])?)
         }
         "uniform" => match a.len() {
-            1 => Box::new(Uniform::new_inclusive(a[0], a[0])?),
             2 => Box::new(Uniform::new_inclusive(a[0], a[1])?),
-            n => bail!("`uniform` expects 1 or 2 arguments, got {n}"),
+            1 => bail!("`uniform` expects 2 arguments (min, max); for a fixed delay use `const`"),
+            n => bail!("`uniform` expects 2 arguments, got {n}"),
         },
         "weibull" => {
             expect(2)?;
@@ -213,7 +227,7 @@ mod tests {
     #[test]
     fn pert_args_are_min_max_mode_shape() {
         // mode=1 is inside [0, 10]; with mode and shape swapped it would be out of range
-        build_dyn_distf32("pert", &[0.0, 10.0, 1.0, 20.0]).unwrap();
+        build_dyn_dist("pert", &[0.0, 10.0, 1.0, 20.0]).unwrap();
     }
 
     fn eval_str(arg: &str) -> Result<f64> {
@@ -250,11 +264,29 @@ mod tests {
     }
 
     #[test]
-    fn arg_must_be_non_negative_f32() {
+    fn arg_must_be_non_negative() {
         let err = |tab: &str| format!("{:#}", parse(tab).err().unwrap());
         assert!(err("exp(1 - 2) $ true").contains("`1 - 2` is negative"));
-        assert!(err("exp(10^39) $ true").contains("too large"));
         parse("exp(1/60) $ true\nnormal(-1 + 2, 0) $ true").unwrap();
+    }
+
+    #[test]
+    fn const_and_uniform() {
+        let d = build_dyn_dist("const", &[42.5]).unwrap();
+        assert!((0..10).all(|_| d.sample() == 42.5));
+
+        let d = build_dyn_dist("uniform", &[1.0, 2.0]).unwrap();
+        assert!(
+            (0..100)
+                .map(|_| d.sample())
+                .all(|x| (1.0..=2.0).contains(&x))
+        );
+
+        let err = build_dyn_dist("uniform", &[10.0])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("use `const`"), "{err}");
     }
 
     #[test]
