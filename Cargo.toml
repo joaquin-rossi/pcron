@@ -7,10 +7,12 @@ edition = "2024"
 rust-version = "1.85"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/joaquin-rossi/pcron"
+documentation = "https://github.com/joaquin-rossi/pcron#readme"
 readme = "README.md"
 categories = ["command-line-utilities", "date-and-time"]
 keywords = ["cron", "scheduler", "random", "probability", "unix"]
-exclude = [".github"]
+# Cargo.toml and Cargo.lock go in anyway
+include = ["src/", "tests/", "contrib/", "tab", "README.md", "LICENSE"]
 
 [dependencies]
 anyhow = "1.0.100"
@@ -19,7 +21,6 @@ chrono-tz = "0.10.4"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 clap_complete = "4.6.11"
 clap_mangen = "0.3.3"
-hostname = "0.4.2"
 libc = "0.2.191"
 nom = "8.0.0"
 rand = "0.9.3"

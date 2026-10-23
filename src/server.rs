@@ -670,10 +670,7 @@ fn log_line(msg: &str) {
     static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
     let (user, host) = IDENTITY.get_or_init(|| {
         let user = whoami::username().unwrap_or_else(|_| "<unknown-user>".to_string());
-        let host = hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| "<unknown-host>".to_string());
+        let host = whoami::hostname().unwrap_or_else(|_| "<unknown-host>".to_string());
         (user, host)
     });
 
