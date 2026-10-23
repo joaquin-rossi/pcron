@@ -37,6 +37,10 @@ $$
 - `@ days hours` makes the delay count only while that window is open, in local time: days like `mon-fri` or `sat,sun`, hours like `9-18` or `9:30-12,14-18` (either can be left out).
 - `$ ...` runs the rest of the line; a `$$` block ends at a line containing only `$$`.
 - `NAME=value` lines set environment variables for the commands below them (no `$` expansion, like cron).
+- `PCRON_*` variables configure pcron for the commands below them, in seconds (scripts don't get them):
+  - `PCRON_MIN_DELAY` and `PCRON_MAX_DELAY` clamp every sampled delay (default 1s and 1 year);
+  - `PCRON_TIMEOUT` sends SIGTERM to a script that runs longer than that (default: no limit);
+  - `PCRON_SHUTDOWN_TIMEOUT` sends SIGKILL that long after a SIGTERM (default 60).
 - Scripts run with `$SHELL -c`, where `SHELL` can be set in the tab (`/bin/sh` by default). A run starts even if the previous one is still going, like cron.
 - `#` starts a comment.
 
@@ -44,9 +48,8 @@ Distributions: `beta(alpha, beta)`, `cauchy(median, scale)`, `chi_squared(k)`, `
 
 ## Server
 
-- Every delay is clamped to `--min-delay` (default 1s) and `--max-delay` (default 1 year).
 - It logs to stdout, including the scripts' output (`--output discard` to drop it).
 - `SIGHUP` reloads the tab: unchanged commands keep their timers, and an invalid tab is ignored.
-- `SIGTERM` / `SIGINT` stop it, giving running scripts `--shutdown-timeout` seconds (default 10) to finish.
+- `SIGTERM` / `SIGINT` stop it: running scripts get SIGTERM, and are killed after `PCRON_SHUTDOWN_TIMEOUT` or when their `PCRON_TIMEOUT` runs out, whichever comes first.
 
 See `pcron <command> --help` for all the options.

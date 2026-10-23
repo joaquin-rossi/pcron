@@ -13,30 +13,23 @@ use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::{Child, Command},
     signal::unix::{Signal, SignalKind, signal},
-    sync::Notify,
+    sync::{Notify, watch},
     task::{AbortHandle, JoinSet},
-    time::{sleep, timeout},
+    time::{Instant, sleep, sleep_until, timeout},
 };
 
-use crate::{DelayArgs, DelayBounds, SHELL};
+use crate::SHELL;
 use chrono::NaiveDateTime;
-use pcron::{Tab, TabCmd, file, window::Window};
+use pcron::{Settings, Tab, TabCmd, file, window::Window};
 
 // longer lines of script output are cut
 const MAX_LINE: usize = 4096;
 
 #[derive(Args, Debug)]
 pub struct ServerArgs {
-    #[command(flatten)]
-    delay: DelayArgs,
-
     /// What to do with the stdout and stderr of the scripts
     #[arg(long, value_enum, env = "PCRON_OUTPUT", default_value_t = Output::Log)]
     output: Output,
-
-    /// Seconds to wait for running scripts on shutdown before killing them
-    #[arg(long, env = "PCRON_SHUTDOWN_TIMEOUT", default_value_t = 10.0)]
-    shutdown_timeout: f64,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -48,19 +41,22 @@ enum Output {
 }
 
 struct Ctx {
-    bounds: DelayBounds,
     output: Output,
     children: Children,
+    /// what the running scripts should do; each one stops (or is killed) on its own
+    phase: watch::Sender<Phase>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    Running,
+    /// SIGTERM now, SIGKILL when its time is up
+    Stopping,
+    /// SIGKILL now
+    Killing,
 }
 
 pub async fn main_server(tab_path: &Path, args: &ServerArgs) -> Result<()> {
-    let bounds = DelayBounds::new_from_args(&args.delay)?;
-    let grace = Duration::try_from_secs_f64(args.shutdown_timeout).map_err(|_| {
-        anyhow!(
-            "--shutdown-timeout must be a non-negative number of seconds, got {}",
-            args.shutdown_timeout
-        )
-    })?;
     let tab = read_tab(tab_path)?;
 
     let listen = |kind, name| signal(kind).with_context(|| format!("cannot listen for {name}"));
@@ -69,9 +65,9 @@ pub async fn main_server(tab_path: &Path, args: &ServerArgs) -> Result<()> {
     let mut int = listen(SignalKind::interrupt(), "SIGINT")?;
 
     let ctx = Arc::new(Ctx {
-        bounds,
         output: args.output,
         children: Children::default(),
+        phase: watch::Sender::new(Phase::Running),
     });
     let mut loops = Loops::default();
     let n = tab.cmds.len();
@@ -106,7 +102,7 @@ pub async fn main_server(tab_path: &Path, args: &ServerArgs) -> Result<()> {
         Ok(signal) => signal,
         Err(_) => "crash",
     };
-    shutdown(&ctx, grace, reason, &mut term, &mut int).await;
+    shutdown(&ctx, reason, &mut term, &mut int).await;
     result.map(|_| ())
 }
 
@@ -120,22 +116,23 @@ fn read_tab(tab_path: &Path) -> Result<Tab> {
     Ok(tab)
 }
 
-// stop scheduling, ask the running scripts to finish, and kill them if they take too long
-// (or if another SIGTERM / SIGINT arrives)
-async fn shutdown(ctx: &Ctx, grace: Duration, reason: &str, term: &mut Signal, int: &mut Signal) {
+// with the scheduling already stopped: ask the running scripts to finish (each one is
+// killed when its time is up, see watch_child), or kill them all if another SIGTERM /
+// SIGINT arrives
+async fn shutdown(ctx: &Ctx, reason: &str, term: &mut Signal, int: &mut Signal) {
     let running = ctx.children.len();
     log_line(&format!("SHUTDOWN({reason}, running={running})"));
 
     if running > 0 {
-        ctx.children.signal_all(libc::SIGTERM);
+        ctx.phase.send_replace(Phase::Stopping);
         let finished = tokio::select! {
-            res = timeout(grace, ctx.children.wait_empty()) => res.is_ok(),
+            () = ctx.children.wait_empty() => true,
             _ = term.recv() => false,
             _ = int.recv() => false,
         };
         if !finished {
             log_line(&format!("SHUTDOWN(killing={})", ctx.children.len()));
-            ctx.children.signal_all(libc::SIGKILL);
+            ctx.phase.send_replace(Phase::Killing);
             // give them a moment to be reaped, so that their CMD_END gets logged
             let _ = timeout(Duration::from_secs(1), ctx.children.wait_empty()).await;
         }
@@ -227,7 +224,7 @@ async fn server_handle_cmd(tab_cmd: TabCmd, ctx: Arc<Ctx>) {
     let shell = script_shell(&tab_cmd.env);
 
     loop {
-        let secs = ctx.bounds.clamp(tab_cmd.delay.sample());
+        let secs = tab_cmd.settings.bounds.clamp(tab_cmd.delay.sample());
         match &tab_cmd.window {
             None => {
                 log_cmd(&log_script, &format!("SLEEP({secs:.3}s)"));
@@ -249,7 +246,13 @@ async fn server_handle_cmd(tab_cmd: TabCmd, ctx: Arc<Ctx>) {
         let mut cmd = Command::new(shell);
         cmd.arg("-c");
         cmd.arg(&tab_cmd.script);
-        cmd.envs(tab_cmd.env.iter().map(|(k, v)| (k, v)));
+        cmd.envs(
+            tab_cmd
+                .env
+                .iter()
+                .filter(|(k, _)| !file::SETTINGS.contains(&k.as_str()))
+                .map(|(k, v)| (k, v)),
+        );
         cmd.env("SHELL", shell);
         cmd.stdin(Stdio::null());
         match ctx.output {
@@ -281,7 +284,13 @@ async fn server_handle_cmd(tab_cmd: TabCmd, ctx: Arc<Ctx>) {
         log_cmd(&log_script, &format!("CMD_START(pid={pid})"));
 
         // not part of the loop task: a reload that stops the loop lets the script finish
-        tokio::spawn(watch_child(proc, pid, log_script.clone(), ctx.clone()));
+        tokio::spawn(watch_child(
+            proc,
+            pid,
+            log_script.clone(),
+            tab_cmd.settings,
+            ctx.clone(),
+        ));
     }
 }
 
@@ -314,7 +323,16 @@ fn script_shell(env: &[(String, String)]) -> &str {
         .map_or(SHELL, |(_, v)| v)
 }
 
-async fn watch_child(mut proc: Child, pid: u32, log_script: String, ctx: Arc<Ctx>) {
+// logs its output and its end, and stops it: SIGTERM after PCRON_TIMEOUT and SIGKILL
+// PCRON_SHUTDOWN_TIMEOUT later; on shutdown, SIGTERM right away and SIGKILL after the
+// shorter of PCRON_SHUTDOWN_TIMEOUT and what is left of its PCRON_TIMEOUT
+async fn watch_child(
+    mut proc: Child,
+    pid: u32,
+    log_script: String,
+    settings: Settings,
+    ctx: Arc<Ctx>,
+) {
     let mut readers = JoinSet::new();
     if let Some(out) = proc.stdout.take() {
         readers.spawn(forward_lines(out, "CMD_OUT", pid, log_script.clone()));
@@ -323,7 +341,43 @@ async fn watch_child(mut proc: Child, pid: u32, log_script: String, ctx: Arc<Ctx
         readers.spawn(forward_lines(err, "CMD_ERR", pid, log_script.clone()));
     }
 
-    let msg = match proc.wait().await {
+    let timeout_at = settings.timeout.map(|t| Instant::now() + t);
+    let mut kill_at: Option<Instant> = None;
+    let mut asked = false;
+    let mut phase = ctx.phase.subscribe();
+    // it may have started while already shutting down
+    phase.mark_changed();
+
+    let status = loop {
+        tokio::select! {
+            status = proc.wait() => break status,
+            () = sleep_until_some(timeout_at), if !asked => {
+                log_cmd(&log_script, &format!("CMD_TIMEOUT(pid={pid})"));
+                signal_group(pid, libc::SIGTERM);
+                asked = true;
+                kill_at = earliest(kill_at, Some(Instant::now() + settings.shutdown_timeout));
+            }
+            () = sleep_until_some(kill_at) => {
+                log_cmd(&log_script, &format!("CMD_KILL(pid={pid})"));
+                signal_group(pid, libc::SIGKILL);
+                kill_at = None;
+            }
+            Ok(()) = phase.changed() => match *phase.borrow_and_update() {
+                Phase::Running => {}
+                Phase::Stopping => {
+                    if !asked {
+                        signal_group(pid, libc::SIGTERM);
+                        asked = true;
+                    }
+                    let grace = Instant::now() + settings.shutdown_timeout;
+                    kill_at = earliest(kill_at, earliest(Some(grace), timeout_at));
+                }
+                Phase::Killing => kill_at = Some(Instant::now()),
+            },
+        }
+    };
+
+    let msg = match status {
         Ok(status) => format!("CMD_END(pid={pid}, {})", fmt_status(status)),
         Err(e) => format!("CMD_ERROR(pid={pid}, cannot wait: {e})"),
     };
@@ -379,7 +433,29 @@ async fn skip_line(r: &mut (impl AsyncBufRead + Unpin)) -> io::Result<()> {
     }
 }
 
-/// running scripts, by pid (which is also their process group)
+async fn sleep_until_some(at: Option<Instant>) {
+    match at {
+        Some(at) => sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        _ => a.or(b),
+    }
+}
+
+// the pid of a script is also its process group, so this reaches whatever it started too
+fn signal_group(pid: u32, signal: libc::c_int) {
+    if let Ok(pgid) = libc::pid_t::try_from(pid) {
+        // SAFETY: kill has no memory safety requirements; a negative pid targets the group
+        unsafe { libc::kill(-pgid, signal) };
+    }
+}
+
+/// running scripts, by pid
 #[derive(Default)]
 struct Children {
     pids: Mutex<HashSet<u32>>,
@@ -398,16 +474,6 @@ impl Children {
 
     fn len(&self) -> usize {
         self.pids.lock().unwrap().len()
-    }
-
-    fn signal_all(&self, signal: libc::c_int) {
-        for &pid in self.pids.lock().unwrap().iter() {
-            let Ok(pgid) = libc::pid_t::try_from(pid) else {
-                continue;
-            };
-            // SAFETY: kill has no memory safety requirements; a negative pid targets the group
-            unsafe { libc::kill(-pgid, signal) };
-        }
     }
 
     async fn wait_empty(&self) {
@@ -471,9 +537,9 @@ mod tests {
     #[tokio::test]
     async fn reload_matches_commands_by_content() {
         let ctx = Arc::new(Ctx {
-            bounds: DelayBounds::new(1000.0, 1000.0).unwrap(),
             output: Output::Discard,
             children: Children::default(),
+            phase: watch::Sender::new(Phase::Running),
         });
         let mut loops = Loops::default();
 

@@ -27,6 +27,16 @@ TAB FORMAT:
   - NAME=value lines set environment variables for the commands below them,
     up to the end of the line; quotes keep the outer blanks, and $ is not
     expanded.
+  - Some variables configure pcron instead of the script (which doesn't get
+    them), also for the commands below them; their values are in seconds
+    and can use arithmetic, and empty means the default:
+
+      PCRON_MIN_DELAY=1          every sampled delay is at least this
+      PCRON_MAX_DELAY=31536000   and at most this (a year)
+      PCRON_TIMEOUT=             SIGTERM after running this long (empty or
+                                 0: no limit)
+      PCRON_SHUTDOWN_TIMEOUT=60  SIGKILL this long after SIGTERM
+
   - Scripts run with $SHELL -c, where SHELL can be set in the tab
     (/bin/sh by default). A run starts even if the previous one is still
     going, like cron.
@@ -50,9 +60,9 @@ TAB FORMAT:
 SIGNALS:
   - SIGHUP reloads the tab: commands that did not change keep their timers,
     and an invalid tab is ignored.
-  - SIGTERM and SIGINT stop the server: running scripts get SIGTERM and
-    --shutdown-timeout seconds to finish before they are killed; a second
-    signal kills them right away.
+  - SIGTERM and SIGINT stop the server: running scripts get SIGTERM, and
+    are killed after PCRON_SHUTDOWN_TIMEOUT or when their PCRON_TIMEOUT runs
+    out, whichever comes first; a second signal kills them right away.
 
 FILES:
   $XDG_CONFIG_HOME/pcron/tab (or ~/.config/pcron/tab) is the default tab.

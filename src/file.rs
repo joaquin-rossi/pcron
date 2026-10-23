@@ -1,11 +1,19 @@
 pub mod lexer;
 pub mod parser;
 
-use crate::{Delay, DistFloat, Tab, TabCmd, window::Window};
+use crate::{Delay, DelayBounds, DistFloat, Settings, Tab, TabCmd, window::Window};
 use parser::Expr;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs, path::Path, time::Duration};
+
+/// the variables of the tab that configure pcron instead of the scripts
+pub const SETTINGS: [&str; 4] = [
+    "PCRON_MIN_DELAY",
+    "PCRON_MAX_DELAY",
+    "PCRON_TIMEOUT",
+    "PCRON_SHUTDOWN_TIMEOUT",
+];
 
 pub fn read(path: impl AsRef<Path>) -> Result<Tab> {
     let path = path.as_ref();
@@ -41,6 +49,7 @@ pub fn parse(text: &str) -> Result<Tab> {
                         .map_err(|e| anyhow!("line {}: in `@ {text}`: {e}", cmd.line))
                 })
                 .transpose()?;
+            let settings = settings(&cmd.env).with_context(|| format!("line {}", cmd.line))?;
             let source = text[cmd.span]
                 .split_whitespace()
                 .collect::<Vec<_>>()
@@ -52,12 +61,56 @@ pub fn parse(text: &str) -> Result<Tab> {
                 delay,
                 window,
                 env: cmd.env,
+                settings,
                 script: cmd.script,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(Tab { cmds })
+}
+
+// the PCRON_ variables in effect for a command; an empty one means the default
+fn settings(env: &[(String, String)]) -> Result<Settings> {
+    let mut settings = Settings::default();
+    let (mut min, mut max) = (settings.bounds.min, settings.bounds.max);
+    for (name, value) in env.iter().filter(|(name, _)| name.starts_with("PCRON_")) {
+        let secs = seconds(value).with_context(|| format!("in `{name}={value}`"))?;
+        let duration = |secs: f64| {
+            Duration::try_from_secs_f64(secs).map_err(|_| anyhow!("in `{name}={value}`: too long"))
+        };
+        match name.as_str() {
+            "PCRON_MIN_DELAY" => min = secs.unwrap_or(min),
+            "PCRON_MAX_DELAY" => max = secs.unwrap_or(max),
+            // 0 means no limit too
+            "PCRON_TIMEOUT" => {
+                settings.timeout = secs.filter(|&s| s > 0.0).map(duration).transpose()?;
+            }
+            "PCRON_SHUTDOWN_TIMEOUT" => {
+                if let Some(secs) = secs {
+                    settings.shutdown_timeout = duration(secs)?;
+                }
+            }
+            _ => bail!(
+                "unknown setting `{name}` (the PCRON_ ones are {})",
+                SETTINGS.join(", ")
+            ),
+        }
+    }
+    settings.bounds = DelayBounds::new(min, max).map_err(|e| anyhow!(e))?;
+    Ok(settings)
+}
+
+// a constant expression, like the arguments of a distribution; None if empty
+fn seconds(value: &str) -> Result<Option<f64>> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    // the value has a single line, so leave out the "line 1" of the messages
+    let unline = |e: String| anyhow!(e.strip_prefix("line 1: ").unwrap_or(&e).to_string());
+    let tokens = lexer::tokenize(value).map_err(unline)?;
+    let expr = parser::parse_expr(&tokens).map_err(unline)?;
+    eval_arg(&expr).map(Some)
 }
 
 // constant parts are evaluated now; a constant delay must not be negative (a random one
@@ -365,6 +418,39 @@ mod tests {
                 .contains("line 3: the name `a` is already used on line 1")
         );
         assert!(err("60 @ funday $ x").contains("line 1: in `@ funday`: unknown day"));
+    }
+
+    #[test]
+    fn settings_apply_to_the_commands_below() {
+        let tab = parse(
+            "\
+1 $ x
+PCRON_MIN_DELAY=0.5
+PCRON_TIMEOUT=2*60
+1 $ y
+PCRON_TIMEOUT=
+PCRON_MAX_DELAY=3600
+PCRON_SHUTDOWN_TIMEOUT=3
+1 $ z",
+        )
+        .unwrap();
+        let s: Vec<_> = tab.cmds.iter().map(|c| c.settings).collect();
+        assert_eq!(s[0], Settings::default());
+        assert_eq!(s[1].bounds.min, 0.5);
+        assert_eq!(s[1].timeout, Some(Duration::from_secs(120)));
+        assert_eq!(s[2].bounds, DelayBounds::new(0.5, 3600.0).unwrap());
+        assert_eq!(s[2].timeout, None);
+        assert_eq!(s[2].shutdown_timeout, Duration::from_secs(3));
+
+        let err = |tab: &str| format!("{:#}", parse(tab).err().unwrap());
+        assert!(err("PCRON_TIMOUT=1\n1 $ x").contains("unknown setting `PCRON_TIMOUT`"));
+        assert!(err("PCRON_TIMEOUT=exp(1)\n1 $ x").contains("must be constant"));
+        assert!(err("PCRON_TIMEOUT=1 2\n1 $ x").contains("expected the end of the value"));
+        assert!(err("PCRON_MIN_DELAY=-1\n1 $ x").contains("is negative"));
+        assert!(
+            err("PCRON_MIN_DELAY=9\nPCRON_MAX_DELAY=5\n\n1 $ x")
+                .contains("line 4: PCRON_MAX_DELAY must be")
+        );
     }
 
     #[test]

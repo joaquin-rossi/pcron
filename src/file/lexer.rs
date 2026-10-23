@@ -4,8 +4,8 @@ use nom::{
     IResult, Parser,
     branch::alt,
     bytes::complete::{tag, take_while, take_while1},
-    character::complete::{char, digit0, digit1, line_ending, multispace0, one_of, space0},
-    combinator::{eof, opt, recognize},
+    character::complete::{char, line_ending, multispace0, space0},
+    combinator::{eof, recognize},
     error::{ErrorKind, ParseError},
     sequence::preceded,
 };
@@ -179,17 +179,33 @@ fn lex_comma(i: &str) -> LexResult<'_, Token> {
     char(',').map(|_| Token::Comma).parse(i)
 }
 
-// unsigned: `1`, `1.5`, `1.`, `.5`, `1e-3` (signs are lexed as operators)
+// unsigned: `1`, `1.5`, `1.`, `.5`, `1e-3` (signs are lexed as operators); scanned by
+// hand because nom's recognize got it wrong at the end of the input ("1.5" -> "1")
 fn lex_num(i: &str) -> LexResult<'_, Token> {
-    recognize((
-        alt((
-            recognize((digit1, opt((char('.'), digit0)))),
-            recognize((char('.'), digit1)),
-        )),
-        opt((one_of("eE"), opt(one_of("+-")), digit1)),
-    ))
-    .map(|s: &str| Token::Num(s.parse().expect("recognized float syntax")))
-    .parse(i)
+    let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+
+    let mut n = digits(i);
+    if i[n..].starts_with('.') {
+        n += 1 + digits(&i[n + 1..]);
+    }
+    if n == 0 || &i[..n] == "." {
+        return Err(nom::Err::Error(LexError::from_error_kind(
+            i,
+            ErrorKind::Digit,
+        )));
+    }
+
+    let rest = &i[n..];
+    if rest.starts_with(['e', 'E']) {
+        let sign = usize::from(rest[1..].starts_with(['+', '-']));
+        let exp = digits(&rest[1 + sign..]);
+        if exp > 0 {
+            n += 1 + sign + exp;
+        }
+    }
+
+    let num = i[..n].parse().expect("scanned float syntax");
+    Ok((&i[n..], Token::Num(num)))
 }
 
 // '+' | '-' | '*' | '/' | '^'
@@ -335,6 +351,12 @@ mod tests {
     #[test]
     fn numbers_and_operators() {
         use Token::*;
+        for (text, num) in [("1.5", 1.5), ("10.25", 10.25), ("2e3", 2e3), ("7.", 7.0)] {
+            let toks = tokenize(text).unwrap();
+            assert_eq!(toks[0].token, Num(num), "{text}");
+            assert_eq!(toks.len(), 1, "{text}");
+        }
+
         let toks: Vec<_> = tokenize("2-1 +.5*1e-3/ 1.^-x")
             .unwrap()
             .into_iter()

@@ -109,6 +109,16 @@ pub fn parse(input: &[Lexeme]) -> Result<File, String> {
     Ok(File { cmds })
 }
 
+/// a lone expression (the value of a setting)
+pub fn parse_expr(input: &[Lexeme]) -> Result<Expr, String> {
+    let mut p = Parser { input, pos: 0 };
+    let e = p.expr()?;
+    if p.peek().is_some() {
+        return p.error("the end of the value");
+    }
+    Ok(e)
+}
+
 struct Parser<'a> {
     input: &'a [Lexeme],
     pos: usize,

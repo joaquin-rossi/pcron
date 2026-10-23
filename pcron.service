@@ -8,10 +8,10 @@ Description=pcron: probabilistic cron
 [Service]
 ExecStart=%h/.cargo/bin/pcron server
 ExecReload=/bin/kill -HUP $MAINPID
-# pcron stops the scripts itself (see --shutdown-timeout), so only signal it,
-# and give it more time than that before killing everything
+# pcron stops the scripts itself (see PCRON_SHUTDOWN_TIMEOUT in the tab), so only
+# signal it, and give it more time than that before killing everything
 KillMode=mixed
-TimeoutStopSec=15s
+TimeoutStopSec=90s
 Restart=on-failure
 
 [Install]

@@ -4,33 +4,28 @@ use rand::{SeedableRng, rngs::StdRng};
 use serde::Serialize;
 use std::{collections::BTreeMap, path::Path};
 
-use crate::{DelayArgs, DelayBounds};
-use pcron::{Delay, TabCmd, file, window::Window};
+use pcron::{Delay, DelayBounds, Settings, TabCmd, file, window::Window};
 
 const SAMPLES: usize = 10_000;
 const SCRIPT_WIDTH: usize = 30;
 
 #[derive(Args, Debug)]
 pub struct ListArgs {
-    #[command(flatten)]
-    delay: DelayArgs,
-
     /// Print as JSON (with the full scripts and unrounded numbers)
     #[arg(long)]
     json: bool,
 }
 
 pub fn main_list(tab_path: &Path, args: &ListArgs) -> Result<()> {
-    let bounds = DelayBounds::new_from_args(&args.delay)?;
     let tab = file::read(tab_path)?;
     let stats: Vec<_> = tab
         .cmds
         .iter()
-        .map(|cmd| Stats::sample(&cmd.delay, cmd.window.as_ref(), bounds))
+        .map(|cmd| Stats::sample(&cmd.delay, cmd.window.as_ref(), cmd.settings.bounds))
         .collect();
 
     if args.json {
-        print_json(&tab.cmds, &stats, bounds)
+        print_json(&tab.cmds, &stats)
     } else {
         print_table(&tab.cmds, &stats);
         Ok(())
@@ -39,8 +34,6 @@ pub fn main_list(tab_path: &Path, args: &ListArgs) -> Result<()> {
 
 #[derive(Serialize)]
 struct JsonList<'a> {
-    min_delay: f64,
-    max_delay: f64,
     commands: Vec<JsonCmd<'a>>,
 }
 
@@ -52,15 +45,35 @@ struct JsonCmd<'a> {
     definition: &'a str,
     computed: String,
     window: Option<String>,
+    /// for the script (without the PCRON_ settings)
     env: BTreeMap<&'a str, &'a str>,
+    settings: JsonSettings,
     /// in seconds (of open window, if there is one)
     delay: &'a Stats,
 }
 
-fn print_json(cmds: &[TabCmd], stats: &[Stats], bounds: DelayBounds) -> Result<()> {
+/// in seconds
+#[derive(Serialize)]
+struct JsonSettings {
+    min_delay: f64,
+    max_delay: f64,
+    timeout: Option<f64>,
+    shutdown_timeout: f64,
+}
+
+impl From<Settings> for JsonSettings {
+    fn from(s: Settings) -> Self {
+        Self {
+            min_delay: s.bounds.min,
+            max_delay: s.bounds.max,
+            timeout: s.timeout.map(|t| t.as_secs_f64()),
+            shutdown_timeout: s.shutdown_timeout.as_secs_f64(),
+        }
+    }
+}
+
+fn print_json(cmds: &[TabCmd], stats: &[Stats]) -> Result<()> {
     let list = JsonList {
-        min_delay: bounds.min,
-        max_delay: bounds.max,
         commands: cmds
             .iter()
             .zip(stats)
@@ -74,8 +87,10 @@ fn print_json(cmds: &[TabCmd], stats: &[Stats], bounds: DelayBounds) -> Result<(
                 env: cmd
                     .env
                     .iter()
+                    .filter(|(k, _)| !file::SETTINGS.contains(&k.as_str()))
                     .map(|(k, v)| (k.as_str(), v.as_str()))
                     .collect(),
+                settings: cmd.settings.into(),
                 delay,
             })
             .collect(),
@@ -93,6 +108,7 @@ fn print_table(cmds: &[TabCmd], stats: &[Stats]) {
         ("DEFINITION", true),
         ("COMPUTED", true),
         ("WINDOW", true),
+        ("TIMEOUT", false),
         ("MEAN", false),
         ("STDDEV", false),
         ("P5", false),
@@ -103,10 +119,11 @@ fn print_table(cmds: &[TabCmd], stats: &[Stats]) {
     ];
     let rows: Vec<_> = cmds.iter().zip(stats).map(|(cmd, s)| row(cmd, s)).collect();
 
-    // NAME and WINDOW only if some command has one
+    // NAME, WINDOW and TIMEOUT only if some command has one
     let shown: Vec<usize> = (0..columns.len())
         .filter(|&i| {
-            !matches!(columns[i].0, "NAME" | "WINDOW") || rows.iter().any(|r| !r[i].is_empty())
+            !matches!(columns[i].0, "NAME" | "WINDOW" | "TIMEOUT")
+                || rows.iter().any(|r| !r[i].is_empty())
         })
         .collect();
     let pick = |row: &[String]| -> Vec<String> { shown.iter().map(|&i| row[i].clone()).collect() };
@@ -129,6 +146,10 @@ fn row(cmd: &TabCmd, s: &Stats) -> Vec<String> {
         cmd.window
             .as_ref()
             .map(Window::to_string)
+            .unwrap_or_default(),
+        cmd.settings
+            .timeout
+            .map(|t| fmt_duration(t.as_secs_f64()))
             .unwrap_or_default(),
         fmt_duration(s.mean),
         fmt_duration(s.std_dev),
