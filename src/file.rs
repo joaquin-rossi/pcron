@@ -8,7 +8,14 @@ use crate::{
 use parser::Expr;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use std::{collections::HashMap, fs, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 /// the variables of the tab that configure pcron instead of the scripts
 pub const SETTINGS: [&str; 6] = [
@@ -20,31 +27,109 @@ pub const SETTINGS: [&str; 6] = [
     "PCRON_ON_FAILURE",
 ];
 
+/// a tab is the file `path` plus every `*.tab` in the directory `path.d`, in alphabetical
+/// order (either may be missing, not both); each file is parsed on its own, so variables
+/// don't carry over from one to the next
 pub fn read(path: impl AsRef<Path>) -> Result<Tab> {
     let path = path.as_ref();
-    let file =
-        fs::read_to_string(path).with_context(|| format!("cannot read tab {}", path.display()))?;
-    parse(&file).with_context(|| format!("invalid tab {}", path.display()))
+    let files = tab_files(path)?;
+    ensure!(
+        !files.is_empty(),
+        "cannot find the tab: neither {} nor {}/*.tab exist",
+        path.display(),
+        dropin_dir(path).display()
+    );
+    let texts = files
+        .into_iter()
+        .map(|file| {
+            let text = fs::read_to_string(&file)
+                .with_context(|| format!("cannot read tab {}", file.display()))?;
+            Ok((file, text))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    parse_files(path, &texts)
 }
 
+/// `path.d`, where the rest of the files of the tab `path` are
+pub fn dropin_dir(path: &Path) -> PathBuf {
+    let mut dir = OsString::from(path.as_os_str());
+    dir.push(".d");
+    PathBuf::from(dir)
+}
+
+/// the files of the tab `path` that exist: `path` itself first, and then `path.d/*.tab`
+/// (which leaves out editor backups, and the hidden copies of `pcron edit`)
+pub fn tab_files(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => files.push(path.to_path_buf()),
+        Ok(_) => bail!("the tab {} is not a file", path.display()),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("cannot read tab {}", path.display())),
+    }
+
+    let dir = dropin_dir(path);
+    match fs::read_dir(&dir) {
+        Ok(entries) => {
+            let mut more: Vec<_> = entries
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| {
+                    let name = p.file_name().unwrap_or_default().to_string_lossy();
+                    !name.starts_with('.') && name.ends_with(".tab") && p.is_file()
+                })
+                .collect();
+            more.sort();
+            files.extend(more);
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", dir.display())),
+    }
+    Ok(files)
+}
+
+/// the files of the tab `path` (see read), with their contents
+pub fn parse_files(path: &Path, files: &[(PathBuf, String)]) -> Result<Tab> {
+    // shown relative to the tab's directory: `tab`, `tab.d/backup.tab`
+    let base = path.parent().unwrap_or(Path::new(""));
+    let mut cmds = Vec::new();
+    for (file, text) in files {
+        let tab = parse(text).with_context(|| format!("invalid tab {}", file.display()))?;
+        let shown = file
+            .strip_prefix(base)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        cmds.extend(tab.cmds.into_iter().map(|cmd| TabCmd {
+            file: shown.clone(),
+            ..cmd
+        }));
+    }
+    check_names(&cmds)?;
+    Ok(Tab { cmds })
+}
+
+/// names are unique (in the whole tab)
+fn check_names(cmds: &[TabCmd]) -> Result<()> {
+    let mut names = HashMap::new();
+    for cmd in cmds {
+        if let Some(name) = &cmd.name {
+            if let Some(first) = names.insert(name, cmd.at()) {
+                bail!("{}: the name `{name}` is already used at {first}", cmd.at());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// a lone file
 pub fn parse(text: &str) -> Result<Tab> {
     let tokens = lexer::tokenize(text).map_err(|e| anyhow!(e))?;
     let ast = parser::parse(&tokens).map_err(|e| anyhow!(e))?;
 
-    let mut names = HashMap::new();
     let cmds = ast
         .cmds
         .into_iter()
         .map(|cmd| {
-            if let Some(name) = &cmd.name {
-                if let Some(first) = names.insert(name.clone(), cmd.line) {
-                    bail!(
-                        "line {}: the name `{name}` is already used on line {first}",
-                        cmd.line
-                    );
-                }
-            }
-
             let delay = build_delay(&cmd.expr)
                 .with_context(|| format!("line {}: in `{}`", cmd.line, cmd.expr))?;
             let window = cmd
@@ -60,6 +145,7 @@ pub fn parse(text: &str) -> Result<Tab> {
                 .collect::<Vec<_>>()
                 .join(" ");
             Ok(TabCmd {
+                file: String::new(),
                 line: cmd.line,
                 name: cmd.name,
                 source,
@@ -72,6 +158,7 @@ pub fn parse(text: &str) -> Result<Tab> {
         })
         .collect::<Result<Vec<_>>>()?;
 
+    check_names(&cmds)?;
     Ok(Tab { cmds })
 }
 
@@ -429,7 +516,7 @@ mod tests {
         let err = |tab: &str| format!("{:#}", parse(tab).err().unwrap());
         assert!(
             err("a: 60 $ x\n\na: 60 $ y")
-                .contains("line 3: the name `a` is already used on line 1")
+                .contains("line 3: the name `a` is already used at line 1")
         );
         assert!(err("60 @ funday $ x").contains("line 1: in `@ funday`: unknown day"));
     }
@@ -492,6 +579,58 @@ PCRON_ON_FAILURE=
             err.contains("in `PCRON_TZ=Nowhere`: unknown time zone"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_tab_is_a_file_and_its_directory() {
+        let dir = std::env::temp_dir().join(format!("pcron-tab-test-{}", std::process::id()));
+        let tab = dir.join("tab");
+        let d = dropin_dir(&tab);
+        fs::create_dir_all(&d).unwrap();
+        let write = |p: &Path, text: &str| fs::write(p, text).unwrap();
+        let files = |tab: &Tab| -> Vec<String> { tab.cmds.iter().map(TabCmd::at).collect() };
+
+        assert!(
+            read(&tab)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("cannot find the tab")
+        );
+
+        // just the directory, in order, without backups or hidden files
+        write(&d.join("b.tab"), "X=1\n1 $ b");
+        write(&d.join("a.tab"), "\n1 $ a");
+        write(&d.join("a.tab~"), "nope");
+        write(&d.join(".a.tab.1234.tmp"), "nope");
+        write(&d.join("notes.txt"), "nope");
+        assert_eq!(
+            files(&read(&tab).unwrap()),
+            ["tab.d/a.tab:2", "tab.d/b.tab:2"]
+        );
+
+        // the file comes first, and its variables don't reach the directory
+        write(&tab, "X=2\n1 $ main");
+        let t = read(&tab).unwrap();
+        assert_eq!(files(&t), ["tab:2", "tab.d/a.tab:2", "tab.d/b.tab:2"]);
+        let env: Vec<_> = t.cmds.iter().map(|c| c.env.len()).collect();
+        assert_eq!(env, [1, 0, 1]);
+
+        // names are unique across files
+        write(&d.join("c.tab"), "main: 1 $ x");
+        write(&tab, "main: 1 $ main");
+        let err = format!("{:#}", read(&tab).err().unwrap());
+        assert!(
+            err.contains("tab.d/c.tab:1: the name `main` is already used at tab:1"),
+            "{err}"
+        );
+
+        // an error says which file
+        write(&d.join("c.tab"), "oops");
+        let err = format!("{:#}", read(&tab).err().unwrap());
+        assert!(err.contains("c.tab: line 1:"), "{err}");
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

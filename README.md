@@ -7,12 +7,13 @@ Original idea: [https://news.ycombinator.com/item?id=46401425](https://news.ycom
 ## Usage
 
 ```sh
-pcron edit      # edit the tab
-pcron list      # list the commands
-pcron server    # run them
+pcron edit         # edit the tab
+pcron edit backup  # edit tab.d/backup.tab
+pcron list         # list the commands
+pcron server       # run them
 ```
 
-The tab lives in `$XDG_CONFIG_HOME/pcron/tab` (or `~/.config/pcron/tab`); use `--tab` or `PCRON_TAB` for another one.
+The tab is `$XDG_CONFIG_HOME/pcron/tab` (or `~/.config/pcron/tab`, or `$PCRON_TAB`) plus every `*.tab` in the `tab.d/` next to it; either may be missing. Each file stands on its own: variables don't carry over from one to the next.
 
 ## Tab
 
@@ -53,7 +54,7 @@ Distributions: `beta(alpha, beta)`, `cauchy(median, scale)`, `chi_squared(k)`, `
 ## Server
 
 - It logs to stdout, including the scripts' output (`--output discard` to drop it).
-- It saves the next run of each command in `$XDG_STATE_HOME/pcron/`, so a restart resumes them; a run that was missed while it was down happens right away.
+- It saves the next run of each command in `$XDG_STATE_HOME/pcron/` (or `$PCRON_STATE`), so a restart resumes them; a run that was missed while it was down happens right away.
 - `SIGHUP` reloads the tab: unchanged commands keep their timers, and an invalid tab is ignored.
 - `SIGTERM` / `SIGINT` stop it: running scripts get SIGTERM, and are killed after `PCRON_SHUTDOWN_TIMEOUT` or when their `PCRON_TIMEOUT` runs out, whichever comes first.
 

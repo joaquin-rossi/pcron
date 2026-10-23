@@ -65,6 +65,11 @@ TAB FORMAT:
       log_normal(mu, sigma)                weibull(scale, shape)
       normal(mean, std_dev)
 
+ENVIRONMENT:
+  PCRON_TAB is the tab to use instead (with its .d directory too).
+  PCRON_STATE is the file to keep the timers in instead (each tab needs its
+  own).
+
 SIGNALS:
   - SIGHUP reloads the tab: commands that did not change keep their timers,
     and an invalid tab is ignored.
@@ -73,6 +78,10 @@ SIGNALS:
     out, whichever comes first; a second signal kills them right away.
 
 FILES:
-  $XDG_CONFIG_HOME/pcron/tab (or ~/.config/pcron/tab) is the default tab.
-  $XDG_STATE_HOME/pcron/ (or ~/.local/state/pcron/) keeps the next run of each
-  command, so that a restart resumes them (and a missed one runs right away).
+  $XDG_CONFIG_HOME/pcron/tab (or ~/.config/pcron/tab) is the tab, along with
+  every *.tab in the tab.d/ next to it, in alphabetical order (either may be
+  missing). Each file stands on its own: variables don't carry over from one
+  to the next.
+  $XDG_STATE_HOME/pcron/ (or ~/.local/state/pcron/, or $PCRON_STATE) keeps the
+  next run of each command, so that a restart resumes them (and a missed one
+  runs right away).

@@ -59,9 +59,12 @@ struct SavedTimer {
     next: String,
 }
 
-/// $XDG_STATE_HOME/pcron/timers-<hash of the tab's path>.json (or ~/.local/state/...), so
-/// that servers of different tabs don't share it
+/// $PCRON_STATE, or else $XDG_STATE_HOME/pcron/timers-<hash of the tab's path>.json (or
+/// ~/.local/state/...), so that servers of different tabs don't share it
 pub fn path(tab: &Path) -> Option<PathBuf> {
+    if let Some(state) = env::var_os("PCRON_STATE").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(state));
+    }
     let absolute = |var| {
         env::var_os(var)
             .map(PathBuf::from)

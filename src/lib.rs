@@ -14,6 +14,8 @@ pub struct Tab {
 }
 
 pub struct TabCmd {
+    /// the file it is in, as shown in messages (empty when parsing a lone text)
+    pub file: String,
     pub line: usize,
     pub name: Option<String>,
     /// the delay as written in the tab, e.g. `3600 + exp(1/600)`
@@ -27,6 +29,17 @@ pub struct TabCmd {
     pub env: Vec<(String, String)>,
     pub settings: Settings,
     pub script: String,
+}
+
+impl TabCmd {
+    /// where it is, for messages: `line 3`, or `tab.d/backup.tab:3`
+    pub fn at(&self) -> String {
+        if self.file.is_empty() {
+            format!("line {}", self.line)
+        } else {
+            format!("{}:{}", self.file, self.line)
+        }
+    }
 }
 
 /// the PCRON_ variables of the tab, which can change from one command to the next

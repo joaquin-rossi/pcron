@@ -15,16 +15,29 @@ use tokio::{
 use crate::SHELL;
 use pcron::file;
 
-// like visudo: edit a copy, check it, and only then put it in place
-pub async fn main_edit(tab: &Path) -> Result<()> {
+// like visudo: edit a copy, check it (with the rest of the tab), and only then put it in
+// place; `name` picks tab.d/NAME.tab instead of the tab file
+pub async fn main_edit(tab: &Path, name: Option<&str>) -> Result<()> {
     let editor = find_editor()?;
-    if let Some(dir) = tab.parent().filter(|d| !d.as_os_str().is_empty()) {
+    let target = match name {
+        None => tab.to_path_buf(),
+        Some(name) => {
+            let name = name.strip_suffix(".tab").unwrap_or(name);
+            ensure!(
+                !name.is_empty() && !name.starts_with('.') && !name.contains('/'),
+                "`{name}` is not a valid file name"
+            );
+            file::dropin_dir(tab).join(format!("{name}.tab"))
+        }
+    };
+    let target: &Path = &target;
+    if let Some(dir) = target.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir)
             .with_context(|| format!("cannot create directory {}", dir.display()))?;
     }
 
-    let original = read_existing(tab)?;
-    let mut copy = EditCopy::create(tab, original.as_deref())?;
+    let original = read_existing(target)?;
+    let mut copy = EditCopy::create(target, original.as_deref())?;
 
     // the editor owns the terminal; don't let ^C (or a hangup) kill us and leave the copy behind
     let _signals = catch_signals()?;
@@ -35,37 +48,59 @@ pub async fn main_edit(tab: &Path) -> Result<()> {
         let text = fs::read_to_string(&copy.path)
             .with_context(|| format!("cannot read {}", copy.path.display()))?;
         if Some(text.as_str()) == original.as_deref() || (original.is_none() && text.is_empty()) {
-            eprintln!("no changes, {} was not modified", tab.display());
+            eprintln!("no changes, {} was not modified", target.display());
             return Ok(());
         }
 
-        match file::parse(&text) {
+        match check(tab, target, &text) {
             Ok(_) => {
                 // nothing locks the tab while it is edited, so check nobody else changed it
-                if read_existing(tab)? != original {
+                if read_existing(target)? != original {
                     copy.keep();
                     bail!(
                         "{} changed while you were editing it, so it was not replaced; \
                          your version is in {}",
-                        tab.display(),
+                        target.display(),
                         copy.path.display()
                     );
                 }
                 copy.install()?;
                 eprintln!(
                     "installed {} (a running server picks it up with `pkill -HUP -x pcron`)",
-                    tab.display()
+                    target.display()
                 );
                 return Ok(());
             }
             Err(e) => {
                 eprintln!("error: {e:#}");
                 if !ask_edit_again()? {
-                    bail!("changes discarded, {} was not modified", tab.display());
+                    bail!("changes discarded, {} was not modified", target.display());
                 }
             }
         }
     }
+}
+
+// the whole tab, with `text` as the contents of `target`
+fn check(tab: &Path, target: &Path, text: &str) -> Result<()> {
+    let mut files = file::tab_files(tab)?;
+    if !files.iter().any(|f| f == target) {
+        files.push(target.to_path_buf());
+    }
+    // in the order read uses: the tab file first, then the rest by name
+    files.sort_by_key(|f| (f != tab, f.clone()));
+    let texts = files
+        .into_iter()
+        .map(|f| {
+            let contents = if f == target {
+                text.to_string()
+            } else {
+                fs::read_to_string(&f).with_context(|| format!("cannot read {}", f.display()))?
+            };
+            Ok((f, contents))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    file::parse_files(tab, &texts).map(drop)
 }
 
 // $VISUAL, $EDITOR, or else vi or ed, as POSIX tools do

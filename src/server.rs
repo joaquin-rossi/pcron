@@ -77,7 +77,10 @@ pub async fn main_server(tab_path: &Path, args: &ServerArgs) -> Result<()> {
             Saved::new()
         }),
         None => {
-            log_line("TIMERS_ERROR(neither $XDG_STATE_HOME nor $HOME is set; not saving them)");
+            log_line(
+                "TIMERS_ERROR(none of $PCRON_STATE, $XDG_STATE_HOME or $HOME is set; \
+                 not saving them)",
+            );
             Saved::new()
         }
     };

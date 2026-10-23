@@ -56,6 +56,7 @@ struct JsonList<'a> {
 
 #[derive(Serialize)]
 struct JsonCmd<'a> {
+    file: &'a str,
     line: usize,
     name: Option<&'a str>,
     script: &'a str,
@@ -100,6 +101,7 @@ fn print_json(cmds: &[TabCmd], stats: &[Stats]) -> Result<()> {
             .iter()
             .zip(stats)
             .map(|(cmd, delay)| JsonCmd {
+                file: &cmd.file,
                 line: cmd.line,
                 name: cmd.name.as_deref(),
                 script: &cmd.script,
@@ -124,6 +126,7 @@ fn print_json(cmds: &[TabCmd], stats: &[Stats]) -> Result<()> {
 fn print_table(cmds: &[TabCmd], stats: &[Stats]) {
     // (header, aligned left: text columns go left, numeric ones right)
     let columns = [
+        ("FILE", true),
         ("LINE", false),
         ("NAME", true),
         ("SCRIPT", true),
@@ -141,11 +144,13 @@ fn print_table(cmds: &[TabCmd], stats: &[Stats]) {
     ];
     let rows: Vec<_> = cmds.iter().zip(stats).map(|(cmd, s)| row(cmd, s)).collect();
 
-    // NAME, WINDOW and TIMEOUT only if some command has one
+    // FILE only if there are several, and NAME, WINDOW and TIMEOUT if some command has one
+    let several = several_files(cmds);
     let shown: Vec<usize> = (0..columns.len())
-        .filter(|&i| {
-            !matches!(columns[i].0, "NAME" | "WINDOW" | "TIMEOUT")
-                || rows.iter().any(|r| !r[i].is_empty())
+        .filter(|&i| match columns[i].0 {
+            "FILE" => several,
+            "NAME" | "WINDOW" | "TIMEOUT" => rows.iter().any(|r| !r[i].is_empty()),
+            _ => true,
         })
         .collect();
     let pick = |row: &[String]| -> Vec<String> { shown.iter().map(|&i| row[i].clone()).collect() };
@@ -158,8 +163,13 @@ fn print_table(cmds: &[TabCmd], stats: &[Stats]) {
     print!("{}", render(&table, &left));
 }
 
+fn several_files(cmds: &[TabCmd]) -> bool {
+    cmds.iter().any(|c| c.file != cmds[0].file)
+}
+
 fn row(cmd: &TabCmd, s: &Stats) -> Vec<String> {
     vec![
+        cmd.file.clone(),
         cmd.line.to_string(),
         cmd.name.clone().unwrap_or_default(),
         script_preview(&cmd.script),
@@ -222,6 +232,7 @@ fn simulate(tab_path: &Path, cmds: &[TabCmd], secs: f64, json: bool) -> Result<(
         #[derive(Serialize)]
         struct JsonRun<'a> {
             time: String,
+            file: &'a str,
             line: usize,
             name: Option<&'a str>,
             script: &'a str,
@@ -239,6 +250,7 @@ fn simulate(tab_path: &Path, cmds: &[TabCmd], secs: f64, json: bool) -> Result<(
                 .iter()
                 .map(|&(at, cmd)| JsonRun {
                     time: at.with_timezone(&chrono::Local).to_rfc3339(),
+                    file: &cmd.file,
                     line: cmd.line,
                     name: cmd.name.as_deref(),
                     script: &cmd.script,
@@ -249,21 +261,33 @@ fn simulate(tab_path: &Path, cmds: &[TabCmd], secs: f64, json: bool) -> Result<(
         return Ok(());
     }
 
-    let header = ["TIME", "LINE", "NAME", "SCRIPT"]
-        .map(String::from)
-        .to_vec();
+    // the line goes with its file if there are several
+    let several = several_files(cmds);
+    let header = [
+        "TIME",
+        if several { "AT" } else { "LINE" },
+        "NAME",
+        "SCRIPT",
+    ]
+    .map(String::from)
+    .to_vec();
     let rows = runs.iter().take(SHOWN_RUNS).map(|&(at, cmd)| {
         vec![
             at.with_timezone(&chrono::Local)
                 .format("%a %b %d %H:%M:%S")
                 .to_string(),
-            cmd.line.to_string(),
+            if several {
+                format!("{}:{}", cmd.file, cmd.line)
+            } else {
+                cmd.line.to_string()
+            },
             cmd.name.clone().unwrap_or_default(),
             script_preview(&cmd.script),
         ]
     });
     let table: Vec<_> = std::iter::once(header).chain(rows).collect();
-    print!("{}", render(&table, &[true, false, true, true]));
+    // a lone line number goes right, like numbers; file:line left, like text
+    print!("{}", render(&table, &[true, several, true, true]));
 
     let shown = if runs.len() > SHOWN_RUNS {
         format!(" (showing the first {SHOWN_RUNS})")
