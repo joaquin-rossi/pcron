@@ -1,10 +1,14 @@
+mod dist;
 pub mod lexer;
 pub mod parser;
+mod settings;
 
-use crate::{
-    Delay, DelayBounds, DistFloat, Settings, Tab, TabCmd,
-    window::{Window, Zone},
-};
+pub use settings::SETTINGS;
+
+use dist::build_dyn_dist;
+use settings::settings;
+
+use crate::{Delay, Tab, TabCmd, window::Window};
 use parser::Expr;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -14,18 +18,7 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
-    time::Duration,
 };
-
-/// the variables of the tab that configure pcron instead of the scripts
-pub const SETTINGS: [&str; 6] = [
-    "PCRON_MIN_DELAY",
-    "PCRON_MAX_DELAY",
-    "PCRON_TIMEOUT",
-    "PCRON_SHUTDOWN_TIMEOUT",
-    "PCRON_TZ",
-    "PCRON_ON_FAILURE",
-];
 
 /// a tab is the file `path` plus every `*.tab` in the directory `path.d`, in alphabetical
 /// order (either may be missing, not both); each file is parsed on its own, so variables
@@ -162,58 +155,6 @@ pub fn parse(text: &str) -> Result<Tab> {
     Ok(Tab { cmds })
 }
 
-// the PCRON_ variables in effect for a command; an empty one means the default
-fn settings(env: &[(String, String)]) -> Result<Settings> {
-    let mut settings = Settings::default();
-    let (mut min, mut max) = (settings.bounds.min, settings.bounds.max);
-    for (name, value) in env.iter().filter(|(name, _)| name.starts_with("PCRON_")) {
-        let in_setting = || format!("in `{name}={value}`");
-        let secs = || seconds(value).with_context(in_setting);
-        let duration = |secs: f64| {
-            Duration::try_from_secs_f64(secs).map_err(|_| anyhow!("{}: too long", in_setting()))
-        };
-        let text = value.trim();
-        match name.as_str() {
-            "PCRON_MIN_DELAY" => min = secs()?.unwrap_or(min),
-            "PCRON_MAX_DELAY" => max = secs()?.unwrap_or(max),
-            // 0 means no limit too
-            "PCRON_TIMEOUT" => {
-                settings.timeout = secs()?.filter(|&s| s > 0.0).map(duration).transpose()?;
-            }
-            "PCRON_SHUTDOWN_TIMEOUT" => {
-                if let Some(secs) = secs()? {
-                    settings.shutdown_timeout = duration(secs)?;
-                }
-            }
-            "PCRON_TZ" if text.is_empty() => settings.tz = Zone::Local,
-            "PCRON_TZ" => {
-                settings.tz = Zone::parse(text).map_err(|e| anyhow!("{}: {e}", in_setting()))?;
-            }
-            "PCRON_ON_FAILURE" => {
-                settings.on_failure = Some(text.to_string()).filter(|t| !t.is_empty());
-            }
-            _ => bail!(
-                "unknown setting `{name}` (the PCRON_ ones are {})",
-                SETTINGS.join(", ")
-            ),
-        }
-    }
-    settings.bounds = DelayBounds::new(min, max).map_err(|e| anyhow!(e))?;
-    Ok(settings)
-}
-
-// a constant expression, like the arguments of a distribution; None if empty
-fn seconds(value: &str) -> Result<Option<f64>> {
-    if value.trim().is_empty() {
-        return Ok(None);
-    }
-    // the value has a single line, so leave out the "line 1" of the messages
-    let unline = |e: String| anyhow!(e.strip_prefix("line 1: ").unwrap_or(&e).to_string());
-    let tokens = lexer::tokenize(value).map_err(unline)?;
-    let expr = parser::parse_expr(&tokens).map_err(unline)?;
-    eval_arg(&expr).map(Some)
-}
-
 // constant parts are evaluated now; a constant delay must not be negative (a random one
 // is clamped when sampled)
 fn build_delay(e: &Expr) -> Result<Delay> {
@@ -250,7 +191,7 @@ fn build(e: &Expr) -> Result<Delay> {
 
 // arguments must be constant and end up non-negative (eval already rejects non-finite
 // values)
-fn eval_arg(e: &Expr) -> Result<f64> {
+pub(super) fn eval_arg(e: &Expr) -> Result<f64> {
     let v = eval(e)?;
     ensure!(v >= 0.0, "`{e}` is negative ({v})");
     Ok(v)
@@ -268,155 +209,11 @@ fn eval(e: &Expr) -> Result<f64> {
     Ok(v)
 }
 
-// - beta(alpha, beta)
-// - cauchy(median, scale)
-// - chi_squared(k)
-// - exp(lambda)
-// - exp1()
-// - fisher_f(m, n)
-// - frechet(location, scale, shape)
-// - gamma(shape, scale)
-// - gumbel(location, scale)
-// - inverse_gaussian(mean, shape)
-// - log_normal(mu, sigma)
-// - normal(mean, std_dev)
-// - normal_inverse_gaussian(alpha, beta)
-// - pareto(scale, shape)
-// - pert(min, max, mode, shape)
-// - poisson(lambda)
-// - skew_normal(location, scale, shape)
-// - standard_normal()
-// - standard_uniform()
-// - student_t(nu)
-// - triangular(min, max, mode)
-// - uniform(min, max)
-// - weibull(scale, shape)
-pub fn build_dyn_dist(name: &str, a: &[f64]) -> Result<Box<dyn DistFloat>> {
-    let expect = |n: usize| {
-        if a.len() == n {
-            Ok(())
-        } else {
-            Err(anyhow!("`{name}` expects {n} argument(s), got {}", a.len()))
-        }
-    };
-
-    use rand_distr::{
-        Beta, Cauchy, ChiSquared, Exp, Exp1, FisherF, Frechet, Gamma, Gumbel, InverseGaussian,
-        LogNormal, Normal, NormalInverseGaussian, Pareto, Pert, Poisson, SkewNormal,
-        StandardNormal, StandardUniform, StudentT, Triangular, Uniform, Weibull,
-    };
-    let d: Box<dyn DistFloat> = match name {
-        "beta" => {
-            expect(2)?;
-            Box::new(Beta::new(a[0], a[1])?)
-        }
-        "const" => bail!("there is no `const`: for a fixed delay write just the number"),
-        "cauchy" => {
-            expect(2)?;
-            Box::new(Cauchy::new(a[0], a[1])?)
-        }
-        "chi_squared" | "chisquared" | "chi2" => {
-            expect(1)?;
-            Box::new(ChiSquared::new(a[0])?)
-        }
-        "exp" | "exponential" => {
-            expect(1)?;
-            Box::new(Exp::new(a[0])?)
-        }
-        "exp1" => {
-            expect(0)?;
-            Box::new(Exp1)
-        }
-        "fisher_f" | "fisherf" | "f" => {
-            expect(2)?;
-            Box::new(FisherF::new(a[0], a[1])?)
-        }
-        "frechet" => {
-            expect(3)?;
-            Box::new(Frechet::new(a[0], a[1], a[2])?)
-        }
-        "gamma" => {
-            expect(2)?;
-            Box::new(Gamma::new(a[0], a[1])?)
-        }
-        "gumbel" => {
-            expect(2)?;
-            Box::new(Gumbel::new(a[0], a[1])?)
-        }
-        "inverse_gaussian" | "inversegaussian" | "wald" => {
-            expect(2)?;
-            Box::new(InverseGaussian::new(a[0], a[1])?)
-        }
-        "log_normal" | "lognormal" => {
-            expect(2)?;
-            Box::new(LogNormal::new(a[0], a[1])?)
-        }
-        "normal" => {
-            expect(2)?;
-            Box::new(Normal::new(a[0], a[1])?)
-        }
-        "normal_inverse_gaussian" | "normalinversegaussian" | "nig" => {
-            expect(2)?;
-            Box::new(NormalInverseGaussian::new(a[0], a[1])?)
-        }
-        "pareto" => {
-            expect(2)?;
-            Box::new(Pareto::new(a[0], a[1])?)
-        }
-        "pert" => {
-            expect(4)?;
-            Box::new(Pert::new(a[0], a[1]).with_shape(a[3]).with_mode(a[2])?)
-        }
-        "poisson" => {
-            expect(1)?;
-            Box::new(Poisson::new(a[0])?)
-        }
-        "skew_normal" | "skewnormal" => {
-            expect(3)?;
-            Box::new(SkewNormal::new(a[0], a[1], a[2])?)
-        }
-        "standard_normal" | "std_normal" => {
-            expect(0)?;
-            Box::new(StandardNormal)
-        }
-        "standard_uniform" | "std_uniform" => {
-            expect(0)?;
-            Box::new(StandardUniform)
-        }
-        "student_t" | "studentt" | "t" => {
-            expect(1)?;
-            Box::new(StudentT::new(a[0])?)
-        }
-        "triangular" => {
-            expect(3)?;
-            Box::new(Triangular::new(a[0], a[1], a[2])?)
-        }
-        "uniform" => match a.len() {
-            2 => Box::new(Uniform::new_inclusive(a[0], a[1])?),
-            1 => bail!(
-                "`uniform` expects 2 arguments (min, max); for a fixed delay write just the number"
-            ),
-            n => bail!("`uniform` expects 2 arguments, got {n}"),
-        },
-        "weibull" => {
-            expect(2)?;
-            Box::new(Weibull::new(a[0], a[1])?)
-        }
-        _ => bail!("unknown distribution `{name}`"),
-    };
-
-    Ok(d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pert_args_are_min_max_mode_shape() {
-        // mode=1 is inside [0, 10]; with mode and shape swapped it would be out of range
-        build_dyn_dist("pert", &[0.0, 10.0, 1.0, 20.0]).unwrap();
-    }
+    use crate::{DelayBounds, Settings, window::Zone};
+    use std::time::Duration;
 
     fn eval_str(expr: &str) -> Result<f64> {
         let tokens = lexer::tokenize(&format!("{expr} $ true")).unwrap();

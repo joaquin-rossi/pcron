@@ -4,7 +4,15 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    # only patches: for 0.x crates a "minor" (0.9 -> 0.10) is a breaking change, and one of those would fail the
+    # whole group
+    groups:
+      patches:
+        update-types: [patch]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

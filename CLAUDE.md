@@ -47,8 +47,8 @@ Other modules: `list.rs` (statistics from 10k seeded samples, `--json`, `--simul
 
 ## Conventions
 
-- `PCRON_*` lines in a tab are pcron settings and are not passed to scripts. To add one, add it to `file::SETTINGS`
-  and to `settings()` in `file.rs`.
+- `PCRON_*` lines in a tab are pcron settings and are not passed to scripts. To add one, add it to `SETTINGS` and
+  to `settings()` in `file/settings.rs`. Distributions are in `file/dist.rs`.
 - `src/help.txt` is both `--help`'s `after_long_help` and the man page. `man.rs` converts it to roff: `HEADING:`
   lines become sections, `- ` starts an item, and lines indented by 6 or more spaces are code.
 - Log lines are `TAG(args) (label)`. The integration tests match on them, so keep the tags stable.
