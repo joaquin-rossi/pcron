@@ -1,5 +1,3 @@
-# vim: ft=crontab
-
 exp(1/60) $ echo poisson >> /tmp/pcron.log
 
 const(10) $$
