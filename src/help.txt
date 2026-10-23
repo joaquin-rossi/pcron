@@ -1,0 +1,48 @@
+TAB FORMAT:
+  Each command is a probability distribution for the delay before its next
+  run, in seconds, followed by a script:
+
+      # about once a minute, on average (a Poisson process)
+      exp(1/60) $ echo hi >> /tmp/pcron.log
+
+      # every 23 to 25 hours
+      uniform(23*3600, 25*3600) $$
+          cd ~/notes
+          git commit -am "$(date)" && git push
+      $$
+
+  - $ ... runs the rest of the line; a $$ block ends at a line
+    containing only $$.
+  - Arguments can use + - * / ^ and parentheses, and must be non-negative.
+  - NAME=value lines set environment variables for the commands below them,
+    up to the end of the line; quotes keep the outer blanks, and $ is not
+    expanded.
+  - Scripts run with $SHELL -c, where SHELL can be set in the tab
+    (/bin/sh by default). A run starts even if the previous one is still
+    going, like cron.
+  - # starts a comment.
+
+  Distributions:
+
+      beta(alpha, beta)                    normal(mean, std_dev)
+      cauchy(median, scale)                normal_inverse_gaussian(alpha, beta)
+      chi_squared(k)                       pareto(scale, shape)
+      const(value)                         pert(min, max, mode, shape)
+      exp(lambda)                          poisson(lambda)
+      exp1()                               skew_normal(location, scale, shape)
+      fisher_f(m, n)                       standard_normal()
+      frechet(location, scale, shape)      standard_uniform()
+      gamma(shape, scale)                  student_t(nu)
+      gumbel(location, scale)              triangular(min, max, mode)
+      inverse_gaussian(mean, shape)        uniform(min, max)
+      log_normal(mu, sigma)                weibull(scale, shape)
+
+SIGNALS:
+  - SIGHUP reloads the tab: commands that did not change keep their timers,
+    and an invalid tab is ignored.
+  - SIGTERM and SIGINT stop the server: running scripts get SIGTERM and
+    --shutdown-timeout seconds to finish before they are killed; a second
+    signal kills them right away.
+
+FILES:
+  $XDG_CONFIG_HOME/pcron/tab (or ~/.config/pcron/tab) is the default tab.

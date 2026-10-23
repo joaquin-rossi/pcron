@@ -2,11 +2,12 @@
 compile_error!("pcron only supports unix");
 
 use anyhow::{Context, Result, ensure};
-use clap::{Args, Parser, Subcommand};
-use std::{env, path::PathBuf, time::Duration};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use std::{env, io, path::PathBuf, time::Duration};
 
 mod edit;
 mod list;
+mod man;
 mod server;
 
 // the editor, and the scripts unless the tab sets SHELL, run with sh (whatever the
@@ -14,7 +15,7 @@ mod server;
 const SHELL: &str = "/bin/sh";
 
 #[derive(Debug, Parser)]
-#[command(about, author, version)]
+#[command(about, author, version, after_long_help = include_str!("help.txt"))]
 struct Cli {
     /// Path to the tab [default: $XDG_CONFIG_HOME/pcron/tab]
     #[arg(long, env = "PCRON_TAB")]
@@ -32,6 +33,10 @@ enum CliMode {
     Edit,
     /// Run the commands in the tab (SIGHUP reloads it)
     Server(server::ServerArgs),
+    /// Print the completions for a shell
+    Completions { shell: clap_complete::Shell },
+    /// Print the man page
+    Man,
 }
 
 #[derive(Args, Debug)]
@@ -48,14 +53,19 @@ struct DelayArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let tab = match cli.tab {
-        Some(tab) => tab,
-        None => default_tab()?,
+    let tab = || match &cli.tab {
+        Some(tab) => Ok(tab.clone()),
+        None => default_tab(),
     };
     match &cli.mode {
-        CliMode::Edit => edit::main_edit(&tab).await,
-        CliMode::List(args) => list::main_list(&tab, args),
-        CliMode::Server(args) => server::main_server(&tab, args).await,
+        CliMode::Edit => edit::main_edit(&tab()?).await,
+        CliMode::List(args) => list::main_list(&tab()?, args),
+        CliMode::Server(args) => server::main_server(&tab()?, args).await,
+        CliMode::Completions { shell } => {
+            clap_complete::generate(*shell, &mut Cli::command(), "pcron", &mut io::stdout());
+            Ok(())
+        }
+        CliMode::Man => man::render(Cli::command(), &mut io::stdout()),
     }
 }
 

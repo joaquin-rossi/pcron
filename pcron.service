@@ -1,0 +1,18 @@
+# systemd user unit: copy to ~/.config/systemd/user/ and run
+#   systemctl --user enable --now pcron
+# (adjust ExecStart if pcron is not installed with cargo)
+
+[Unit]
+Description=pcron: probabilistic cron
+
+[Service]
+ExecStart=%h/.cargo/bin/pcron server
+ExecReload=/bin/kill -HUP $MAINPID
+# pcron stops the scripts itself (see --shutdown-timeout), so only signal it,
+# and give it more time than that before killing everything
+KillMode=mixed
+TimeoutStopSec=15s
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
