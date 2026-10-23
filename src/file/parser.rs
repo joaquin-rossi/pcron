@@ -22,6 +22,13 @@ pub struct DistExpr {
     pub args: Vec<f32>,
 }
 
+impl std::fmt::Display for DistExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let args: Vec<_> = self.args.iter().map(f32::to_string).collect();
+        write!(f, "{}({})", self.name, args.join(", "))
+    }
+}
+
 pub fn parse(input: &[Token]) -> Result<File, String> {
     let input = Tokens(input);
 
@@ -43,13 +50,7 @@ fn parse_file(i: Tokens) -> IResult<Tokens, File> {
 fn parse_cmd(i: Tokens) -> IResult<Tokens, Command> {
     let (i, expr) = parse_dist_expr(i)?;
     let (i, script) = parse_t_script(i)?;
-    Ok((
-        i,
-        Command {
-            expr,
-            script,
-        },
-    ))
+    Ok((i, Command { expr, script }))
 }
 
 // DistExpr := IDENT '(' params ')'
