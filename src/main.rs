@@ -113,10 +113,6 @@ impl DelayBounds {
             secs.clamp(self.min, self.max)
         }
     }
-
-    fn delay(self, secs: f64) -> Duration {
-        Duration::from_secs_f64(self.clamp(secs))
-    }
 }
 
 #[cfg(test)]
@@ -126,11 +122,11 @@ mod tests {
     #[test]
     fn delay_is_bounded() {
         let b = DelayBounds::new(1.0, 60.0).unwrap();
-        assert_eq!(b.delay(-5.0), Duration::from_secs(1));
-        assert_eq!(b.delay(0.0), Duration::from_secs(1));
-        assert_eq!(b.delay(30.0), Duration::from_secs(30));
-        assert_eq!(b.delay(f64::INFINITY), Duration::from_secs(60));
-        assert_eq!(b.delay(f64::NAN), Duration::from_secs(60));
+        assert_eq!(b.clamp(-5.0), 1.0);
+        assert_eq!(b.clamp(0.0), 1.0);
+        assert_eq!(b.clamp(30.0), 30.0);
+        assert_eq!(b.clamp(f64::INFINITY), 60.0);
+        assert_eq!(b.clamp(f64::NAN), 60.0);
     }
 
     #[test]

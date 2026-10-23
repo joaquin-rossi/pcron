@@ -1,13 +1,11 @@
 pub mod lexer;
 pub mod parser;
 
-use crate::{DistFloat, Tab, TabCmd};
-use parser::{BinOp, Expr};
+use crate::{Delay, DistFloat, Tab, TabCmd, window::Window};
+use parser::Expr;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use rand::Rng;
-use rand_distr::Distribution;
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
 pub fn read(path: impl AsRef<Path>) -> Result<Tab> {
     let path = path.as_ref();
@@ -20,31 +18,39 @@ pub fn parse(text: &str) -> Result<Tab> {
     let tokens = lexer::tokenize(text).map_err(|e| anyhow!(e))?;
     let ast = parser::parse(&tokens).map_err(|e| anyhow!(e))?;
 
+    let mut names = HashMap::new();
     let cmds = ast
         .cmds
         .into_iter()
         .map(|cmd| {
-            let (args, dist) = cmd
-                .expr
-                .args
-                .iter()
-                .map(eval_arg)
-                .collect::<Result<Vec<_>>>()
-                .and_then(|args| {
-                    let dist = build_dyn_dist(&cmd.expr.name, &args)?;
-                    Ok((args, dist))
-                })
+            if let Some(name) = &cmd.name {
+                if let Some(first) = names.insert(name.clone(), cmd.line) {
+                    bail!(
+                        "line {}: the name `{name}` is already used on line {first}",
+                        cmd.line
+                    );
+                }
+            }
+
+            let delay = build_delay(&cmd.expr)
                 .with_context(|| format!("line {}: in `{}`", cmd.line, cmd.expr))?;
+            let window = cmd
+                .window
+                .map(|text| {
+                    Window::parse(&text)
+                        .map_err(|e| anyhow!("line {}: in `@ {text}`: {e}", cmd.line))
+                })
+                .transpose()?;
             let source = text[cmd.span]
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
             Ok(TabCmd {
                 line: cmd.line,
+                name: cmd.name,
                 source,
-                name: cmd.expr.name,
-                args,
-                dist,
+                delay,
+                window,
                 env: cmd.env,
                 script: cmd.script,
             })
@@ -54,7 +60,42 @@ pub fn parse(text: &str) -> Result<Tab> {
     Ok(Tab { cmds })
 }
 
-// arguments must end up non-negative (eval already rejects non-finite values)
+// constant parts are evaluated now; a constant delay must not be negative (a random one
+// is clamped when sampled)
+fn build_delay(e: &Expr) -> Result<Delay> {
+    let delay = build(e)?;
+    if let Delay::Const(v) = delay {
+        ensure!(v >= 0.0, "the delay is negative ({v})");
+    }
+    Ok(delay)
+}
+
+fn build(e: &Expr) -> Result<Delay> {
+    if !e.is_random() {
+        return Ok(Delay::Const(eval(e)?));
+    }
+    Ok(match e {
+        Expr::Num(_) => unreachable!("numbers are not random"),
+        Expr::Call(name, args) => {
+            let args = args
+                .iter()
+                .map(eval_arg)
+                .collect::<Result<Vec<_>>>()
+                .with_context(|| format!("in `{e}`"))?;
+            let dist = build_dyn_dist(name, &args).with_context(|| format!("in `{e}`"))?;
+            Delay::Dist {
+                name: name.clone(),
+                args,
+                dist,
+            }
+        }
+        Expr::Neg(x) => Delay::Neg(Box::new(build(x)?)),
+        Expr::Bin(op, l, r) => Delay::Bin(*op, Box::new(build(l)?), Box::new(build(r)?)),
+    })
+}
+
+// arguments must be constant and end up non-negative (eval already rejects non-finite
+// values)
 fn eval_arg(e: &Expr) -> Result<f64> {
     let v = eval(e)?;
     ensure!(v >= 0.0, "`{e}` is negative ({v})");
@@ -65,17 +106,9 @@ fn eval_arg(e: &Expr) -> Result<f64> {
 fn eval(e: &Expr) -> Result<f64> {
     let v = match e {
         Expr::Num(n) => *n,
+        Expr::Call(..) => bail!("`{e}` is random, but distribution arguments must be constant"),
         Expr::Neg(x) => -eval(x)?,
-        Expr::Bin(op, l, r) => {
-            let (l, r) = (eval(l)?, eval(r)?);
-            match op {
-                BinOp::Add => l + r,
-                BinOp::Sub => l - r,
-                BinOp::Mul => l * r,
-                BinOp::Div => l / r,
-                BinOp::Pow => l.powf(r),
-            }
-        }
+        Expr::Bin(op, l, r) => op.apply(eval(l)?, eval(r)?),
     };
     ensure!(v.is_finite(), "`{e}` is not a finite number ({v})");
     Ok(v)
@@ -83,7 +116,6 @@ fn eval(e: &Expr) -> Result<f64> {
 
 // - beta(alpha, beta)
 // - cauchy(median, scale)
-// - const(value)
 // - chi_squared(k)
 // - exp(lambda)
 // - exp1()
@@ -105,15 +137,6 @@ fn eval(e: &Expr) -> Result<f64> {
 // - triangular(min, max, mode)
 // - uniform(min, max)
 // - weibull(scale, shape)
-// always samples the same value
-struct Const(f64);
-
-impl Distribution<f64> for Const {
-    fn sample<R: Rng + ?Sized>(&self, _: &mut R) -> f64 {
-        self.0
-    }
-}
-
 pub fn build_dyn_dist(name: &str, a: &[f64]) -> Result<Box<dyn DistFloat>> {
     let expect = |n: usize| {
         if a.len() == n {
@@ -133,10 +156,7 @@ pub fn build_dyn_dist(name: &str, a: &[f64]) -> Result<Box<dyn DistFloat>> {
             expect(2)?;
             Box::new(Beta::new(a[0], a[1])?)
         }
-        "const" => {
-            expect(1)?;
-            Box::new(Const(a[0]))
-        }
+        "const" => bail!("there is no `const`: for a fixed delay write just the number"),
         "cauchy" => {
             expect(2)?;
             Box::new(Cauchy::new(a[0], a[1])?)
@@ -219,7 +239,9 @@ pub fn build_dyn_dist(name: &str, a: &[f64]) -> Result<Box<dyn DistFloat>> {
         }
         "uniform" => match a.len() {
             2 => Box::new(Uniform::new_inclusive(a[0], a[1])?),
-            1 => bail!("`uniform` expects 2 arguments (min, max); for a fixed delay use `const`"),
+            1 => bail!(
+                "`uniform` expects 2 arguments (min, max); for a fixed delay write just the number"
+            ),
             n => bail!("`uniform` expects 2 arguments, got {n}"),
         },
         "weibull" => {
@@ -242,10 +264,34 @@ mod tests {
         build_dyn_dist("pert", &[0.0, 10.0, 1.0, 20.0]).unwrap();
     }
 
-    fn eval_str(arg: &str) -> Result<f64> {
-        let tokens = lexer::tokenize(&format!("x({arg}) $ true")).unwrap();
+    fn eval_str(expr: &str) -> Result<f64> {
+        let tokens = lexer::tokenize(&format!("{expr} $ true")).unwrap();
         let ast = parser::parse(&tokens).unwrap();
-        eval(&ast.cmds[0].expr.args[0])
+        eval(&ast.cmds[0].expr)
+    }
+
+    fn delay(tab: &str) -> Delay {
+        parse(tab).unwrap().cmds.remove(0).delay
+    }
+
+    #[test]
+    fn delay_expressions() {
+        // constant parts are folded
+        assert_eq!(delay("60 * 60 $ a").to_string(), "3600");
+        let d = delay("2 * 1800 + exp(1/600) $ a");
+        assert_eq!(d.to_string(), "3600 + exp(0.0016666666666666668)");
+        assert!((0..100).all(|_| d.sample() >= 3600.0));
+
+        let d = delay("exp(1) + exp(2) - (uniform(0, 1) * 2) $ a");
+        assert_eq!(d.to_string(), "(exp(1) + exp(2)) - (uniform(0, 1) * 2)");
+        let mean = (0..20_000).map(|_| d.sample()).sum::<f64>() / 20_000.0;
+        assert!((mean - 0.5).abs() < 0.05, "{mean}");
+
+        let err = |tab: &str| format!("{:#}", parse(tab).err().unwrap());
+        assert!(err("exp(uniform(1, 2)) $ a").contains("arguments must be constant"));
+        assert!(err("1 - 2 $ a").contains("the delay is negative"));
+        // random parts may go below 0; they are clamped when sampled
+        parse("-exp(1) $ a").unwrap();
     }
 
     #[test]
@@ -283,9 +329,11 @@ mod tests {
     }
 
     #[test]
-    fn const_and_uniform() {
-        let d = build_dyn_dist("const", &[42.5]).unwrap();
+    fn constant_and_uniform() {
+        let d = delay("42.5 $ a");
         assert!((0..10).all(|_| d.sample() == 42.5));
+        let err = format!("{:#}", parse("const(1) $ a").err().unwrap());
+        assert!(err.contains("write just the number"), "{err}");
 
         let d = build_dyn_dist("uniform", &[1.0, 2.0]).unwrap();
         assert!(
@@ -298,7 +346,25 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(err.contains("use `const`"), "{err}");
+        assert!(err.contains("write just the number"), "{err}");
+    }
+
+    #[test]
+    fn names_and_windows() {
+        let tab = parse("a: 60 @ mon-fri 9-18 $ x\nb: 60 $ y\n60 $ z").unwrap();
+        let names: Vec<_> = tab.cmds.iter().map(|c| c.name.as_deref()).collect();
+        assert_eq!(names, [Some("a"), Some("b"), None]);
+        assert_eq!(
+            tab.cmds[0].window.as_ref().unwrap().to_string(),
+            "mon-fri 9-18"
+        );
+
+        let err = |tab: &str| format!("{:#}", parse(tab).err().unwrap());
+        assert!(
+            err("a: 60 $ x\n\na: 60 $ y")
+                .contains("line 3: the name `a` is already used on line 1")
+        );
+        assert!(err("60 @ funday $ x").contains("line 1: in `@ funday`: unknown day"));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 LOG=/tmp/pcron.log
 
-exp(1/60) $ echo poisson >> "$LOG"
+poisson: exp(1/60) $ echo poisson >> "$LOG"
 
-const(10) $$
-    echo uniform.1 >> "$LOG"
+pair: 10 $$
+    echo pair.1 >> "$LOG"
     sleep 5
-    echo uniform.2 >> "$LOG"
+    echo pair.2 >> "$LOG"
 $$

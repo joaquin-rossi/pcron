@@ -19,7 +19,8 @@ use tokio::{
 };
 
 use crate::{DelayArgs, DelayBounds, SHELL};
-use pcron::{Tab, TabCmd, file};
+use chrono::NaiveDateTime;
+use pcron::{Tab, TabCmd, file, window::Window};
 
 // longer lines of script output are cut
 const MAX_LINE: usize = 4096;
@@ -146,8 +147,10 @@ async fn shutdown(ctx: &Ctx, grace: Duration, reason: &str, term: &mut Signal, i
 /// identifies a command by its content, so that a reload can tell which ones did not change
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct CmdKey {
-    name: String,
-    args: Vec<u64>,
+    name: Option<String>,
+    /// with the constants evaluated (and printed in full), so `2*30` and `60` are the same
+    delay: String,
+    window: Option<String>,
     env: Vec<(String, String)>,
     script: String,
 }
@@ -156,8 +159,8 @@ impl CmdKey {
     fn new(cmd: &TabCmd) -> Self {
         Self {
             name: cmd.name.clone(),
-            // `+ 0.0` turns -0 into 0, so that both get the same bits
-            args: cmd.args.iter().map(|a| (a + 0.0).to_bits()).collect(),
+            delay: cmd.delay.to_string(),
+            window: cmd.window.as_ref().map(Window::to_string),
             env: cmd.env.clone(),
             script: cmd.script.clone(),
         }
@@ -211,21 +214,37 @@ impl Loops {
 }
 
 async fn server_handle_cmd(tab_cmd: TabCmd, ctx: Arc<Ctx>) {
-    let mut script_lines = tab_cmd.script.lines();
-    let mut log_script = script_lines.next().unwrap_or_default().trim().to_string();
-    if script_lines.next().is_some() {
-        log_script.push_str(" ; ...");
-    }
+    // the name if it has one, or else the start of the script
+    let log_script = tab_cmd.name.clone().unwrap_or_else(|| {
+        let mut script_lines = tab_cmd.script.lines();
+        let mut start = script_lines.next().unwrap_or_default().trim().to_string();
+        if script_lines.next().is_some() {
+            start.push_str(" ; ...");
+        }
+        start
+    });
 
     let shell = script_shell(&tab_cmd.env);
 
     loop {
-        let sleep_delay = ctx.bounds.delay(tab_cmd.dist.sample());
-        log_cmd(
-            &log_script,
-            &format!("SLEEP({:.3}s)", sleep_delay.as_secs_f64()),
-        );
-        sleep(sleep_delay).await;
+        let secs = ctx.bounds.clamp(tab_cmd.delay.sample());
+        match &tab_cmd.window {
+            None => {
+                log_cmd(&log_script, &format!("SLEEP({secs:.3}s)"));
+                sleep(Duration::from_secs_f64(secs)).await;
+            }
+            Some(window) => {
+                let until = window.advance(local_now(), secs);
+                log_cmd(
+                    &log_script,
+                    &format!(
+                        "SLEEP({secs:.3}s in @ {window}, until {})",
+                        until.format("%b %d %H:%M:%S")
+                    ),
+                );
+                sleep_in_window(window, until).await;
+            }
+        }
 
         let mut cmd = Command::new(shell);
         cmd.arg("-c");
@@ -263,6 +282,28 @@ async fn server_handle_cmd(tab_cmd: TabCmd, ctx: Arc<Ctx>) {
 
         // not part of the loop task: a reload that stops the loop lets the script finish
         tokio::spawn(watch_child(proc, pid, log_script.clone(), ctx.clone()));
+    }
+}
+
+fn local_now() -> NaiveDateTime {
+    chrono::Local::now().naive_local()
+}
+
+// in short steps, so that a suspend or a clock change can't throw it off; and if it ends up
+// outside the window anyway (say, waking up from a suspend at night), until it opens again
+async fn sleep_in_window(window: &Window, mut until: NaiveDateTime) {
+    const STEP: Duration = Duration::from_secs(60);
+    loop {
+        let now = local_now();
+        if now >= until {
+            if window.contains(now) {
+                return;
+            }
+            until = window.advance(now, 0.0);
+            continue;
+        }
+        let left = (until - now).to_std().unwrap_or_default();
+        sleep(left.min(STEP)).await;
     }
 }
 
@@ -422,9 +463,9 @@ mod tests {
     #[test]
     fn shell() {
         let shell = |tab| script_shell(&cmds(tab)[0].env).to_string();
-        assert_eq!(shell("const(1) $ a"), "/bin/sh");
-        assert_eq!(shell("SHELL=/bin/bash\nconst(1) $ a"), "/bin/bash");
-        assert_eq!(shell("SHELL=\nconst(1) $ a"), "/bin/sh");
+        assert_eq!(shell("1 $ a"), "/bin/sh");
+        assert_eq!(shell("SHELL=/bin/bash\n1 $ a"), "/bin/bash");
+        assert_eq!(shell("SHELL=\n1 $ a"), "/bin/sh");
     }
 
     #[tokio::test]
@@ -436,23 +477,24 @@ mod tests {
         });
         let mut loops = Loops::default();
 
-        let s = loops.sync(cmds("const(1) $ a\nconst(2) $ b\nconst(1) $ a"), &ctx);
+        let s = loops.sync(cmds("1 $ a\n2 $ b\n1 $ a"), &ctx);
         assert_eq!((s.kept, s.started, s.stopped), (0, 3, 0));
 
         // reordered and rewritten (2 == 4/2) commands keep their loop; one `a` goes
         // away, `c` is new, and `a` with another distribution is a different command
-        let s = loops.sync(
-            cmds("const(4/2) $ b\nconst( 1 ) $ a\nconst(1) $ c\nconst(3) $ a"),
-            &ctx,
-        );
+        let s = loops.sync(cmds("4/2 $ b\n( 1 ) $ a\n1 $ c\n3 $ a"), &ctx);
         assert_eq!((s.kept, s.started, s.stopped), (2, 2, 1));
         assert_eq!(loops.by_key.values().map(Vec::len).sum::<usize>(), 4);
 
-        let s = loops.sync(cmds("const(1) $ c"), &ctx);
+        let s = loops.sync(cmds("1 $ c"), &ctx);
         assert_eq!((s.kept, s.started, s.stopped), (1, 0, 3));
 
         // the same command with another environment is a different command
-        let s = loops.sync(cmds("X=1\nconst(1) $ c"), &ctx);
+        let s = loops.sync(cmds("X=1\n1 $ c"), &ctx);
         assert_eq!((s.kept, s.started, s.stopped), (0, 1, 1));
+
+        // and so are a name or a window
+        let s = loops.sync(cmds("X=1\nc: 1 $ c\nX=1\n1 @ 9-18 $ c"), &ctx);
+        assert_eq!((s.kept, s.started, s.stopped), (0, 2, 1));
     }
 }

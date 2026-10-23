@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::{collections::BTreeMap, path::Path};
 
 use crate::{DelayArgs, DelayBounds};
-use pcron::{DistFloat, TabCmd, file};
+use pcron::{Delay, TabCmd, file, window::Window};
 
 const SAMPLES: usize = 10_000;
 const SCRIPT_WIDTH: usize = 30;
@@ -26,7 +26,7 @@ pub fn main_list(tab_path: &Path, args: &ListArgs) -> Result<()> {
     let stats: Vec<_> = tab
         .cmds
         .iter()
-        .map(|cmd| Stats::sample(cmd.dist.as_ref(), bounds))
+        .map(|cmd| Stats::sample(&cmd.delay, cmd.window.as_ref(), bounds))
         .collect();
 
     if args.json {
@@ -47,12 +47,13 @@ struct JsonList<'a> {
 #[derive(Serialize)]
 struct JsonCmd<'a> {
     line: usize,
+    name: Option<&'a str>,
     script: &'a str,
     definition: &'a str,
-    distribution: &'a str,
-    args: &'a [f64],
+    computed: String,
+    window: Option<String>,
     env: BTreeMap<&'a str, &'a str>,
-    /// in seconds
+    /// in seconds (of open window, if there is one)
     delay: &'a Stats,
 }
 
@@ -65,10 +66,11 @@ fn print_json(cmds: &[TabCmd], stats: &[Stats], bounds: DelayBounds) -> Result<(
             .zip(stats)
             .map(|(cmd, delay)| JsonCmd {
                 line: cmd.line,
+                name: cmd.name.as_deref(),
                 script: &cmd.script,
                 definition: &cmd.source,
-                distribution: &cmd.name,
-                args: &cmd.args,
+                computed: cmd.delay.to_string(),
+                window: cmd.window.as_ref().map(Window::to_string),
                 env: cmd
                     .env
                     .iter()
@@ -83,38 +85,51 @@ fn print_json(cmds: &[TabCmd], stats: &[Stats], bounds: DelayBounds) -> Result<(
 }
 
 fn print_table(cmds: &[TabCmd], stats: &[Stats]) {
-    let header = [
-        "LINE",
-        "SCRIPT",
-        "DEFINITION",
-        "COMPUTED",
-        "MEAN",
-        "STDDEV",
-        "P5",
-        "P50",
-        "P95",
-        "RUNS/DAY",
-        "CLAMPED",
+    // (header, aligned left: text columns go left, numeric ones right)
+    let columns = [
+        ("LINE", false),
+        ("NAME", true),
+        ("SCRIPT", true),
+        ("DEFINITION", true),
+        ("COMPUTED", true),
+        ("WINDOW", true),
+        ("MEAN", false),
+        ("STDDEV", false),
+        ("P5", false),
+        ("P50", false),
+        ("P95", false),
+        ("RUNS/DAY", false),
+        ("CLAMPED", false),
     ];
-    let rows = cmds.iter().zip(stats).map(|(cmd, s)| row(cmd, s));
-    let table: Vec<Vec<String>> = std::iter::once(header.map(String::from).to_vec())
-        .chain(rows)
-        .collect();
+    let rows: Vec<_> = cmds.iter().zip(stats).map(|(cmd, s)| row(cmd, s)).collect();
 
-    // text columns go left, numeric ones right
-    let left = [
-        false, true, true, true, false, false, false, false, false, false, false,
-    ];
+    // NAME and WINDOW only if some command has one
+    let shown: Vec<usize> = (0..columns.len())
+        .filter(|&i| {
+            !matches!(columns[i].0, "NAME" | "WINDOW") || rows.iter().any(|r| !r[i].is_empty())
+        })
+        .collect();
+    let pick = |row: &[String]| -> Vec<String> { shown.iter().map(|&i| row[i].clone()).collect() };
+
+    let header: Vec<String> = columns.iter().map(|(h, _)| h.to_string()).collect();
+    let table: Vec<Vec<String>> = std::iter::once(pick(&header))
+        .chain(rows.iter().map(|r| pick(r)))
+        .collect();
+    let left: Vec<bool> = shown.iter().map(|&i| columns[i].1).collect();
     print!("{}", render(&table, &left));
 }
 
 fn row(cmd: &TabCmd, s: &Stats) -> Vec<String> {
-    let args: Vec<_> = cmd.args.iter().map(|&a| fmt_num(a)).collect();
     vec![
         cmd.line.to_string(),
+        cmd.name.clone().unwrap_or_default(),
         script_preview(&cmd.script),
         cmd.source.clone(),
-        format!("{}({})", cmd.name, args.join(", ")),
+        cmd.delay.display_with(&fmt_num),
+        cmd.window
+            .as_ref()
+            .map(Window::to_string)
+            .unwrap_or_default(),
         fmt_duration(s.mean),
         fmt_duration(s.std_dev),
         fmt_duration(s.p5),
@@ -129,7 +144,8 @@ fn row(cmd: &TabCmd, s: &Stats) -> Vec<String> {
     ]
 }
 
-/// statistics of the actual delay (after applying the bounds), estimated by sampling
+/// statistics of the actual delay (after applying the bounds), estimated by sampling; with a
+/// window, the delay is time while it is open
 #[derive(Debug, Serialize)]
 struct Stats {
     mean: f64,
@@ -137,20 +153,21 @@ struct Stats {
     p5: f64,
     p50: f64,
     p95: f64,
-    /// infinite (null in JSON) if the mean delay is 0
+    /// infinite (null in JSON) if the mean delay is 0; with a window, it counts only the
+    /// time it is open
     runs_per_day: f64,
     /// fraction of samples that fell outside the bounds
     clamped: f64,
 }
 
 impl Stats {
-    fn sample(dist: &dyn DistFloat, bounds: DelayBounds) -> Self {
+    fn sample(delay: &Delay, window: Option<&Window>, bounds: DelayBounds) -> Self {
         // fixed seed so that `list` always prints the same numbers
         let mut rng = StdRng::seed_from_u64(0);
         let mut clamped = 0;
         let mut xs: Vec<f64> = (0..SAMPLES)
             .map(|_| {
-                let raw = dist.sample_with(&mut rng);
+                let raw = delay.sample_with(&mut rng);
                 let x = bounds.clamp(raw);
                 if x != raw {
                     clamped += 1;
@@ -171,7 +188,7 @@ impl Stats {
             p5: pct(0.05),
             p50: pct(0.50),
             p95: pct(0.95),
-            runs_per_day: 86400.0 / mean,
+            runs_per_day: window.map_or(86400.0, |w| w.active_secs_per_week() / 7.0) / mean,
             clamped: clamped as f64 / n,
         }
     }
@@ -289,27 +306,30 @@ mod tests {
         assert!(script_preview(&long).ends_with('…'));
     }
 
+    fn stats_of(tab: &str) -> Stats {
+        let cmd = file::parse(tab).unwrap().cmds.remove(0);
+        Stats::sample(
+            &cmd.delay,
+            cmd.window.as_ref(),
+            DelayBounds::new(1.0, 100.0).unwrap(),
+        )
+    }
+
     #[test]
     fn stats() {
-        let bounds = DelayBounds::new(1.0, 100.0).unwrap();
-
-        let s = Stats::sample(
-            file::build_dyn_dist("const", &[42.0]).unwrap().as_ref(),
-            bounds,
-        );
+        let s = stats_of("42 $ a");
         assert_eq!(
-            (s.mean, s.std_dev, s.p50, s.clamped),
-            (42.0, 0.0, 42.0, 0.0)
+            (s.mean, s.std_dev, s.p50, s.clamped, s.runs_per_day),
+            (42.0, 0.0, 42.0, 0.0, 86400.0 / 42.0)
         );
 
-        let s = Stats::sample(
-            file::build_dyn_dist("uniform", &[0.0, 10.0])
-                .unwrap()
-                .as_ref(),
-            bounds,
-        );
+        let s = stats_of("uniform(0, 10) $ a");
         assert!((s.clamped - 0.1).abs() < 0.01, "{s:?}");
         assert!((s.p50 - 5.0).abs() < 0.1, "{s:?}");
         assert!((s.p95 - 9.5).abs() < 0.1, "{s:?}");
+
+        // 10 hours a day open: a run every 60s of that is 600 a day
+        let s = stats_of("60 @ 8-18 $ a");
+        assert_eq!(s.runs_per_day, 600.0);
     }
 }

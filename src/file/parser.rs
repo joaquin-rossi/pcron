@@ -9,25 +9,35 @@ pub struct File {
 #[derive(Debug)]
 pub struct Command {
     pub line: usize,
+    pub name: Option<String>,
     /// the `NAME=value` lines above the command (later ones win), sorted by name
     pub env: Vec<(String, String)>,
-    /// byte range of the distribution in the tab
+    /// byte range of the delay in the tab
     pub span: Range<usize>,
-    pub expr: DistExpr,
+    pub expr: Expr,
+    pub window: Option<String>,
     pub script: String,
-}
-
-#[derive(Debug)]
-pub struct DistExpr {
-    pub name: String,
-    pub args: Vec<Expr>,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Expr {
     Num(f64),
+    /// a distribution
+    Call(String, Vec<Expr>),
     Neg(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
+}
+
+impl Expr {
+    /// whether it has a distribution somewhere
+    pub fn is_random(&self) -> bool {
+        match self {
+            Expr::Num(_) => false,
+            Expr::Call(..) => true,
+            Expr::Neg(e) => e.is_random(),
+            Expr::Bin(_, l, r) => l.is_random() || r.is_random(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,13 +49,6 @@ pub enum BinOp {
     Pow,
 }
 
-impl fmt::Display for DistExpr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let args: Vec<_> = self.args.iter().map(Expr::to_string).collect();
-        write!(f, "{}({})", self.name, args.join(", "))
-    }
-}
-
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // parenthesize nested binary operations so the output is unambiguous
@@ -55,8 +58,24 @@ impl fmt::Display for Expr {
         };
         match self {
             Expr::Num(n) => write!(f, "{n}"),
+            Expr::Call(name, args) => {
+                let args: Vec<_> = args.iter().map(Expr::to_string).collect();
+                write!(f, "{name}({})", args.join(", "))
+            }
             Expr::Neg(e) => write!(f, "-{}", operand(e)),
             Expr::Bin(op, l, r) => write!(f, "{} {op} {}", operand(l), operand(r)),
+        }
+    }
+}
+
+impl BinOp {
+    pub fn apply(self, l: f64, r: f64) -> f64 {
+        match self {
+            BinOp::Add => l + r,
+            BinOp::Sub => l - r,
+            BinOp::Mul => l * r,
+            BinOp::Div => l / r,
+            BinOp::Pow => l.powf(r),
         }
     }
 }
@@ -135,22 +154,29 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    // Cmd := IDENT '(' Args ')' SCRIPT
+    // Cmd := NAME? Expr WINDOW? SCRIPT
     fn cmd(&mut self) -> Result<Command, String> {
         let line = self.line();
-        let start = self.input[self.pos].span.start;
-        let Some(Token::Ident(name)) = self.peek() else {
-            return self.error("a distribution name");
+        let name = match self.peek() {
+            Some(Token::Name(name)) => {
+                self.pos += 1;
+                Some(name.clone())
+            }
+            _ => None,
         };
-        self.pos += 1;
 
-        self.expect(&Token::ParenLeft, &format!("`(` after `{name}`"))?;
-        let args = self.args()?;
-        self.expect(&Token::ParenRight, "`,` or `)`")?;
+        let Some(start) = self.input.get(self.pos).map(|l| l.span.start) else {
+            return self.error("a delay");
+        };
+        let expr = self.expr()?;
         let span = start..self.input[self.pos - 1].span.end;
-        let expr = DistExpr {
-            name: name.clone(),
-            args,
+
+        let window = match self.peek() {
+            Some(Token::Window(text)) => {
+                self.pos += 1;
+                Some(text.clone())
+            }
+            _ => None,
         };
 
         let Some(Token::Script(script)) = self.peek() else {
@@ -162,9 +188,11 @@ impl<'a> Parser<'a> {
 
         Ok(Command {
             line,
+            name,
             env: Vec::new(),
             span,
             expr,
+            window,
             script: script.clone(),
         })
     }
@@ -234,12 +262,19 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Atom := NUM | '(' Expr ')'
+    // Atom := NUM | IDENT '(' Args ')' | '(' Expr ')'
     fn atom(&mut self) -> Result<Expr, String> {
         match self.peek() {
             Some(Token::Num(n)) => {
                 self.pos += 1;
                 Ok(Expr::Num(*n))
+            }
+            Some(Token::Ident(name)) => {
+                self.pos += 1;
+                self.expect(&Token::ParenLeft, &format!("`(` after `{name}`"))?;
+                let args = self.args()?;
+                self.expect(&Token::ParenRight, "`,` or `)`")?;
+                Ok(Expr::Call(name.clone(), args))
             }
             Some(Token::ParenLeft) => {
                 self.pos += 1;
@@ -247,7 +282,7 @@ impl<'a> Parser<'a> {
                 self.expect(&Token::ParenRight, "`)`")?;
                 Ok(e)
             }
-            _ => self.error("a number or `(`"),
+            _ => self.error("a number, a distribution or `(`"),
         }
     }
 }
@@ -274,17 +309,18 @@ mod tests {
             ),
             ("exp(1)\n\n", "line 1: expected a script"),
             (
-                "exp(1) $ a\n(1) $ b",
-                "line 2: expected a distribution name, found `(`",
+                "exp(1) $ a\n$ b",
+                "line 2: expected a number, a distribution or `(`, found script `b`",
             ),
             (
                 "exp(1 +) $ a",
-                "line 1: expected a number or `(`, found `)`",
+                "line 1: expected a number, a distribution or `(`, found `)`",
             ),
+            ("x:", "line 1: expected a delay, found end of file"),
             ("exp((1 $ a", "line 1: expected `)`, found script `a`"),
             (
                 "exp(",
-                "line 1: expected a number or `(`, found end of file",
+                "line 1: expected a number, a distribution or `(`, found end of file",
             ),
         ];
         for (tab, want) in cases {
@@ -303,6 +339,19 @@ mod tests {
             .map(|c| c.env.iter().map(|(k, v)| format!("{k}={v}")).collect())
             .collect();
         assert_eq!(env, [vec![], vec!["A=1", "B=2"], vec!["A=3", "B=2"]]);
+    }
+
+    #[test]
+    fn full_commands() {
+        let tab = "backup: 3600 + exp(1/600) @ mon-fri 9-18 $ a\n2 * (normal(1, 2) - 1) $ b";
+        let file = parse(&tokenize(tab).unwrap()).unwrap();
+        let [a, b] = &file.cmds[..] else { panic!() };
+        assert_eq!(a.name.as_deref(), Some("backup"));
+        assert_eq!(a.expr.to_string(), "3600 + exp(1 / 600)");
+        assert_eq!(a.window.as_deref(), Some("mon-fri 9-18"));
+        assert_eq!(&tab[a.span.clone()], "3600 + exp(1/600)");
+        assert_eq!((b.name.as_deref(), b.window.as_deref()), (None, None));
+        assert_eq!(b.expr.to_string(), "2 * (normal(1, 2) - 1)");
     }
 
     #[test]

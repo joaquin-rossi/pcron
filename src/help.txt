@@ -1,19 +1,29 @@
 TAB FORMAT:
-  Each command is a probability distribution for the delay before its next
-  run, in seconds, followed by a script:
+  Each command is the delay before its next run, in seconds, followed by a
+  script:
 
       # about once a minute, on average (a Poisson process)
       exp(1/60) $ echo hi >> /tmp/pcron.log
 
+      # every 30 to 40 minutes of working hours
+      stretch: uniform(30, 40) * 60 @ mon-fri 9-18 $ notify-send stretch
+
       # every 23 to 25 hours
-      uniform(23*3600, 25*3600) $$
+      notes: 24*3600 + normal(0, 1800) $$
           cd ~/notes
           git commit -am "$(date)" && git push
       $$
 
+  - The delay is made of numbers and distributions, with + - * / ^ and
+    parentheses. A distribution is sampled at every run; its arguments must
+    be constant and non-negative.
+  - name: before the delay labels the command in the logs and in pcron list.
+    Names are optional, and unique.
+  - @ days hours makes the delay count only while that window is open, in
+    local time: days like mon-fri or sat,sun, hours like 9-18 or
+    9:30-12,14-18 (either can be left out).
   - $ ... runs the rest of the line; a $$ block ends at a line
     containing only $$.
-  - Arguments can use + - * / ^ and parentheses, and must be non-negative.
   - NAME=value lines set environment variables for the commands below them,
     up to the end of the line; quotes keep the outer blanks, and $ is not
     expanded.
@@ -24,10 +34,9 @@ TAB FORMAT:
 
   Distributions:
 
-      beta(alpha, beta)                    normal(mean, std_dev)
-      cauchy(median, scale)                normal_inverse_gaussian(alpha, beta)
-      chi_squared(k)                       pareto(scale, shape)
-      const(value)                         pert(min, max, mode, shape)
+      beta(alpha, beta)                    normal_inverse_gaussian(alpha, beta)
+      cauchy(median, scale)                pareto(scale, shape)
+      chi_squared(k)                       pert(min, max, mode, shape)
       exp(lambda)                          poisson(lambda)
       exp1()                               skew_normal(location, scale, shape)
       fisher_f(m, n)                       standard_normal()
@@ -36,6 +45,7 @@ TAB FORMAT:
       gumbel(location, scale)              triangular(min, max, mode)
       inverse_gaussian(mean, shape)        uniform(min, max)
       log_normal(mu, sigma)                weibull(scale, shape)
+      normal(mean, std_dev)
 
 SIGNALS:
   - SIGHUP reloads the tab: commands that did not change keep their timers,

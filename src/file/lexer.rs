@@ -18,6 +18,8 @@ pub enum Token {
     Env(String, String),
     Ident(String),
     Minus,
+    /// `name:`, labels the command after it
+    Name(String),
     Num(f64),
     ParenLeft,
     ParenRight,
@@ -25,6 +27,8 @@ pub enum Token {
     Script(String),
     Slash,
     Star,
+    /// `@ ...`, up to the script
+    Window(String),
 }
 
 impl fmt::Display for Token {
@@ -35,6 +39,7 @@ impl fmt::Display for Token {
             Token::Env(name, value) => write!(f, "assignment `{name}={value}`"),
             Token::Ident(s) => write!(f, "`{s}`"),
             Token::Minus => f.write_str("`-`"),
+            Token::Name(name) => write!(f, "name `{name}:`"),
             Token::Num(n) => write!(f, "`{n}`"),
             Token::ParenLeft => f.write_str("`(`"),
             Token::ParenRight => f.write_str("`)`"),
@@ -45,6 +50,7 @@ impl fmt::Display for Token {
             },
             Token::Slash => f.write_str("`/`"),
             Token::Star => f.write_str("`*`"),
+            Token::Window(text) => write!(f, "window `@ {text}`"),
         }
     }
 }
@@ -126,8 +132,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Lexeme>, String> {
 fn lex_token(i: &str) -> LexResult<'_, Token> {
     alt((
         lex_comma,
+        lex_name,
         lex_env,
         lex_ident,
+        lex_window,
         lex_num,
         lex_op,
         lex_paren_left,
@@ -194,6 +202,32 @@ fn lex_op(i: &str) -> LexResult<'_, Token> {
         char('^').map(|_| Token::Caret),
     ))
     .parse(i)
+}
+
+// name: (letters, digits, `_`, `-` and `.`)
+fn lex_name(i: &str) -> LexResult<'_, Token> {
+    let (i, name) = recognize((
+        take_while1(|c: char| c == '_' || c.is_ascii_alphabetic()),
+        take_while(|c: char| matches!(c, '_' | '-' | '.') || c.is_ascii_alphanumeric()),
+    ))
+    .parse(i)?;
+    let (i, _) = char(':').parse(i)?;
+    Ok((i, Token::Name(name.to_string())))
+}
+
+// @ days hours, up to the script (or the end of the line)
+fn lex_window(i: &str) -> LexResult<'_, Token> {
+    let start = i;
+    let (i, _) = char('@').parse(i)?;
+    let (i, text) = take_while(|c| c != '$' && c != '\n').parse(i)?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(nom::Err::Failure(LexError::new(
+            start,
+            "empty window after `@`",
+        )));
+    }
+    Ok((i, Token::Window(text.to_string())))
 }
 
 // NAME = value, up to the end of the line; quotes around the value keep its outer blanks
@@ -359,6 +393,36 @@ mod tests {
     }
 
     #[test]
+    fn names_and_windows() {
+        use Token::*;
+        let toks: Vec<_> =
+            tokenize("daily-backup.v2: 60 @ mon-fri 9-18 $ x\na: exp(1)\n@ 9-18\n$ y")
+                .unwrap()
+                .into_iter()
+                .map(|l| l.token)
+                .collect();
+        assert_eq!(
+            toks,
+            [
+                Name("daily-backup.v2".to_string()),
+                Num(60.0),
+                Window("mon-fri 9-18".to_string()),
+                Script("x".to_string()),
+                Name("a".to_string()),
+                Ident("exp".to_string()),
+                ParenLeft,
+                Num(1.0),
+                ParenRight,
+                Window("9-18".to_string()),
+                Script("y".to_string()),
+            ]
+        );
+
+        let err = tokenize("exp(1) @ $ x").unwrap_err();
+        assert!(err.contains("empty window"), "{err}");
+    }
+
+    #[test]
     fn single_line_script() {
         assert_eq!(scripts("exp(1) $ echo $$ # pid\n"), ["echo $$ # pid"]);
     }
@@ -402,7 +466,7 @@ mod tests {
 
     #[test]
     fn unexpected_character() {
-        let err = tokenize("# c\nexp(1) @ x\n").unwrap_err();
-        assert!(err.contains("line 2") && err.contains("'@'"), "{err}");
+        let err = tokenize("# c\nexp(1) ! x\n").unwrap_err();
+        assert!(err.contains("line 2") && err.contains("'!'"), "{err}");
     }
 }
