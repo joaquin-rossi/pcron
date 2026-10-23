@@ -29,7 +29,7 @@ pub fn parse(text: &str) -> Result<Tab> {
                 .map(eval_arg)
                 .collect::<Result<Vec<_>>>()
                 .and_then(|args| build_dyn_distf32(&cmd.expr.name, &args))
-                .with_context(|| format!("in `{}`", cmd.expr))?;
+                .with_context(|| format!("line {}: in `{}`", cmd.line, cmd.expr))?;
             Ok(TabCmd {
                 dist,
                 script: cmd.script,

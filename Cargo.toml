@@ -10,7 +10,6 @@ keywords = ["unix"]
 anyhow = "1.0.100"
 chrono = "0.4.43"
 clap = { version = "4.5.54", features = ["derive", "env"] }
-futures = "0.3.31"
 hostname = "0.4.2"
 nom = "8.0.0"
 rand = "0.9.3"

@@ -1,13 +1,12 @@
-use std::{borrow::Cow, ops::Deref};
+use std::{borrow::Cow, fmt};
 
 use nom::{
-    IResult, Input, Needed, Parser,
+    IResult, Parser,
     branch::alt,
     bytes::complete::{tag, take_while, take_while1},
     character::complete::{char, digit0, digit1, line_ending, multispace0, one_of, space0},
     combinator::{eof, opt, recognize},
     error::{ErrorKind, ParseError},
-    multi::many0,
     sequence::preceded,
 };
 
@@ -26,75 +25,31 @@ pub enum Token {
     Star,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Tokens<'a>(pub &'a [Token]);
-
-impl<'a> Deref for Tokens<'a> {
-    type Target = &'a [Token];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<'a> Tokens<'a> {
-    #[inline]
-    pub fn as_slice(self) -> &'a [Token] {
-        self.0
-    }
-}
-
-impl<'a> Input for Tokens<'a> {
-    type Item = &'a Token;
-    type Iter = std::slice::Iter<'a, Token>;
-    type IterIndices = std::iter::Enumerate<std::slice::Iter<'a, Token>>;
-
-    #[inline]
-    fn input_len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    fn take(&self, index: usize) -> Self {
-        Tokens(&self.0[..index])
-    }
-
-    #[inline]
-    fn take_from(&self, index: usize) -> Self {
-        Tokens(&self.0[index..])
-    }
-
-    #[inline]
-    fn take_split(&self, index: usize) -> (Self, Self) {
-        (self.take_from(index), self.take(index))
-    }
-
-    #[inline]
-    fn position<P>(&self, predicate: P) -> Option<usize>
-    where
-        P: Fn(Self::Item) -> bool,
-    {
-        self.0.iter().position(predicate)
-    }
-
-    #[inline]
-    fn iter_elements(&self) -> Self::Iter {
-        self.0.iter()
-    }
-
-    #[inline]
-    fn iter_indices(&self) -> Self::IterIndices {
-        self.0.iter().enumerate()
-    }
-
-    #[inline]
-    fn slice_index(&self, count: usize) -> Result<usize, Needed> {
-        if self.0.len() >= count {
-            Ok(count)
-        } else {
-            Err(Needed::new(count - self.0.len()))
+impl fmt::Display for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Token::Caret => f.write_str("`^`"),
+            Token::Comma => f.write_str("`,`"),
+            Token::Ident(s) => write!(f, "`{s}`"),
+            Token::Minus => f.write_str("`-`"),
+            Token::Num(n) => write!(f, "`{n}`"),
+            Token::ParenLeft => f.write_str("`(`"),
+            Token::ParenRight => f.write_str("`)`"),
+            Token::Plus => f.write_str("`+`"),
+            Token::Script(s) => match s.lines().next() {
+                Some(first) if first.len() < s.len() => write!(f, "script `{first} ...`"),
+                _ => write!(f, "script `{s}`"),
+            },
+            Token::Slash => f.write_str("`/`"),
+            Token::Star => f.write_str("`*`"),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lexeme {
+    pub token: Token,
+    pub line: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -127,43 +82,47 @@ impl<'a> ParseError<&'a str> for LexError<'a> {
 
 type LexResult<'a, T> = IResult<&'a str, T, LexError<'a>>;
 
-pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
-    let line_of = |rest: &str| input[..input.len() - rest.len()].matches('\n').count() + 1;
+pub fn tokenize(input: &str) -> Result<Vec<Lexeme>, String> {
+    let newlines = |from: &str, to: &str| from[..from.len() - to.len()].matches('\n').count();
 
-    match lex_tokens(input) {
-        Ok(("", toks)) => Ok(toks),
-        Ok((rest, _)) => Err(format!(
-            "lex error: line {}: unexpected character {:?}",
-            line_of(rest),
-            rest.chars().next().unwrap_or_default()
-        )),
-        Err(nom::Err::Error(e) | nom::Err::Failure(e)) => {
-            Err(format!("lex error: line {}: {}", line_of(e.input), e.msg))
+    let mut toks = Vec::new();
+    let mut line = 1;
+    let mut i = input;
+    loop {
+        let (rest, _) = lex_junk0(i).map_err(|_| "unexpected input".to_string())?;
+        line += newlines(i, rest);
+        let Some(c) = rest.chars().next() else {
+            return Ok(toks);
+        };
+
+        match lex_token(rest) {
+            Ok((next, token)) => {
+                toks.push(Lexeme { token, line });
+                line += newlines(rest, next);
+                i = next;
+            }
+            Err(nom::Err::Failure(e)) => {
+                return Err(format!(
+                    "line {}: {}",
+                    line + newlines(rest, e.input),
+                    e.msg
+                ));
+            }
+            Err(_) => return Err(format!("line {line}: unexpected character {c:?}")),
         }
-        Err(nom::Err::Incomplete(_)) => Err("lex error: incomplete input".to_string()),
     }
 }
 
-fn lex_tokens(i: &str) -> LexResult<'_, Vec<Token>> {
-    let (i, toks) = many0(lex_token).parse(i)?;
-    let (i, _) = lex_junk0(i)?;
-    Ok((i, toks))
-}
-
-// any single token (skips junk first)
 fn lex_token(i: &str) -> LexResult<'_, Token> {
-    preceded(
-        lex_junk0,
-        alt((
-            lex_comma,
-            lex_ident,
-            lex_num,
-            lex_op,
-            lex_paren_left,
-            lex_paren_right,
-            lex_script,
-        )),
-    )
+    alt((
+        lex_comma,
+        lex_ident,
+        lex_num,
+        lex_op,
+        lex_paren_left,
+        lex_paren_right,
+        lex_script,
+    ))
     .parse(i)
 }
 
@@ -303,7 +262,7 @@ mod tests {
         tokenize(input)
             .unwrap()
             .into_iter()
-            .filter_map(|t| match t {
+            .filter_map(|l| match l.token {
                 Token::Script(s) => Some(s),
                 _ => None,
             })
@@ -313,8 +272,13 @@ mod tests {
     #[test]
     fn numbers_and_operators() {
         use Token::*;
+        let toks: Vec<_> = tokenize("2-1 +.5*1e-3/ 1.^-x")
+            .unwrap()
+            .into_iter()
+            .map(|l| l.token)
+            .collect();
         assert_eq!(
-            tokenize("2-1 +.5*1e-3/ 1.^-x").unwrap(),
+            toks,
             [
                 Num(2.0),
                 Minus,
@@ -330,6 +294,16 @@ mod tests {
                 Ident("x".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn tokens_know_their_line() {
+        let lines: Vec<_> = tokenize("# c\nexp(1) $$\n a\n b\n$$\n\nexp(2)\n  $ c")
+            .unwrap()
+            .into_iter()
+            .map(|l| l.line)
+            .collect();
+        assert_eq!(lines, [2, 2, 2, 2, 2, 7, 7, 7, 7, 8]);
     }
 
     #[test]

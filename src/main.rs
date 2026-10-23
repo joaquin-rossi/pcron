@@ -1,9 +1,17 @@
-#![cfg(unix)]
+#[cfg(not(unix))]
+compile_error!("pcron only supports unix");
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
-use std::{env, path::PathBuf, process::Stdio, time::Duration};
-use tokio::{process::Command, time::sleep};
+use std::{
+    env,
+    io::{self, Write},
+    os::unix::process::ExitStatusExt,
+    path::PathBuf,
+    process::{ExitStatus, Stdio},
+    time::Duration,
+};
+use tokio::{process::Command, task::JoinSet, time::sleep};
 
 use pcron::*;
 
@@ -73,7 +81,7 @@ async fn main_edit(cli: &Cli) -> Result<()> {
         .with_context(|| format!("cannot launch editor `{editor}`"))?;
     ensure!(status.success(), "editor `{editor}` failed: {status}");
 
-    file::read(&cli.tab)?;
+    file::read(&cli.tab).context("the tab was saved, but it has errors")?;
     Ok(())
 }
 
@@ -111,15 +119,22 @@ impl DelayBounds {
 async fn main_server(cli: &Cli, args: &ServerArgs) -> Result<()> {
     let bounds = DelayBounds::new(args.min_delay, args.max_delay)?;
     let tab = file::read(&cli.tab)?;
+    ensure!(
+        !tab.cmds.is_empty(),
+        "tab {} has no commands",
+        cli.tab.display()
+    );
 
+    let mut tasks = JoinSet::new();
     for cmd in tab.cmds {
-        tokio::spawn(async move {
-            server_handle_cmd(cmd, bounds).await;
-        });
+        tasks.spawn(server_handle_cmd(cmd, bounds));
     }
 
-    futures::future::pending::<()>().await;
-    unreachable!()
+    // command loops never return, so a finished task means it panicked
+    match tasks.join_next().await {
+        Some(Err(e)) => bail!("a command loop crashed: {e}"),
+        _ => unreachable!(),
+    }
 }
 
 async fn server_handle_cmd(tab_cmd: TabCmd, bounds: DelayBounds) -> ! {
@@ -148,7 +163,10 @@ async fn server_handle_cmd(tab_cmd: TabCmd, bounds: DelayBounds) -> ! {
         let mut proc = match cmd.spawn() {
             Ok(proc) => proc,
             Err(e) => {
-                log_cmd(&log_script, &format!("CMD_ERROR({e})"));
+                log_cmd(
+                    &log_script,
+                    &format!("CMD_ERROR(cannot spawn `{shell}`: {e})"),
+                );
                 continue;
             }
         };
@@ -159,15 +177,21 @@ async fn server_handle_cmd(tab_cmd: TabCmd, bounds: DelayBounds) -> ! {
         let bg_log_script = log_script.clone();
         tokio::spawn(async move {
             let msg = match proc.wait().await {
-                Ok(proc_status) => format!(
-                    "CMD_END(pid={}, exit={})",
-                    proc_pid,
-                    proc_status.code().unwrap_or(-1)
-                ),
-                Err(e) => format!("CMD_ERROR(pid={}, {e})", proc_pid),
+                Ok(proc_status) => {
+                    format!("CMD_END(pid={}, {})", proc_pid, fmt_status(proc_status))
+                }
+                Err(e) => format!("CMD_ERROR(pid={}, cannot wait: {e})", proc_pid),
             };
             log_cmd(&bg_log_script, &msg);
         });
+    }
+}
+
+fn fmt_status(status: ExitStatus) -> String {
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exit={code}"),
+        (None, Some(signal)) => format!("signal={signal}"),
+        (None, None) => "exit=?".to_string(),
     }
 }
 
@@ -181,7 +205,11 @@ pub fn log_cmd(script: &str, msg: &str) {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "<unknown-host>".to_string());
 
-    println!("{timestamp} {host}: ({user}) {msg} ({script})");
+    // a closed stdout must not take the server down
+    let _ = writeln!(
+        io::stdout(),
+        "{timestamp} {host}: ({user}) {msg} ({script})"
+    );
 }
 
 #[cfg(test)]

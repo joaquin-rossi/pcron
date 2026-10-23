@@ -1,11 +1,5 @@
-use crate::file::lexer::{Token, Tokens};
+use crate::file::lexer::{Lexeme, Token};
 use std::fmt;
-
-use nom::{
-    IResult, Parser,
-    error::ErrorKind,
-    multi::{many0, separated_list0},
-};
 
 #[derive(Debug)]
 pub struct File {
@@ -14,6 +8,7 @@ pub struct File {
 
 #[derive(Debug)]
 pub struct Command {
+    pub line: usize,
     pub expr: DistExpr,
     pub script: String,
 }
@@ -74,153 +69,218 @@ impl fmt::Display for BinOp {
     }
 }
 
-pub fn parse(input: &[Token]) -> Result<File, String> {
-    let input = Tokens(input);
-
-    let (rest, file) = parse_file(input).map_err(|e| format!("parse error: {e:?}"))?;
-    if rest.is_empty() {
-        Ok(file)
-    } else {
-        Err(format!("parse error: unconsumed input: {:?}", rest))
+pub fn parse(input: &[Lexeme]) -> Result<File, String> {
+    let mut p = Parser { input, pos: 0 };
+    let mut cmds = Vec::new();
+    while p.peek().is_some() {
+        cmds.push(p.cmd()?);
     }
+    Ok(File { cmds })
 }
 
-// File := Cmd*
-fn parse_file(i: Tokens) -> IResult<Tokens, File> {
-    let (i, cmds) = many0(parse_cmd).parse(i)?;
-    Ok((i, File { cmds }))
+struct Parser<'a> {
+    input: &'a [Lexeme],
+    pos: usize,
 }
 
-// Cmd := DistExpr Script
-fn parse_cmd(i: Tokens) -> IResult<Tokens, Command> {
-    let (i, expr) = parse_dist_expr(i)?;
-    let (i, script) = parse_t_script(i)?;
-    Ok((i, Command { expr, script }))
-}
-
-// DistExpr := IDENT '(' params ')'
-fn parse_dist_expr(i: Tokens) -> IResult<Tokens, DistExpr> {
-    let (i, name) = parse_t_ident(i)?;
-    let (i, _) = parse_t_paren_left(i)?;
-    let (i, params) = parse_params_sep_with_comma(i)?;
-    let (i, _) = parse_t_paren_right(i)?;
-
-    Ok((i, DistExpr { name, args: params }))
-}
-
-// params := (Expr (',' Expr)*)?
-fn parse_params_sep_with_comma(i: Tokens) -> IResult<Tokens, Vec<Expr>> {
-    separated_list0(parse_t_comma, parse_expr).parse(i)
-}
-
-// Expr := Term (('+' | '-') Term)*
-fn parse_expr(i: Tokens) -> IResult<Tokens, Expr> {
-    let (mut i, mut lhs) = parse_term(i)?;
-    loop {
-        let op = match i.first() {
-            Some(Token::Plus) => BinOp::Add,
-            Some(Token::Minus) => BinOp::Sub,
-            _ => return Ok((i, lhs)),
-        };
-        let (rest, rhs) = parse_term(Tokens(&i[1..]))?;
-        lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
-        i = rest;
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Option<&'a Token> {
+        self.input.get(self.pos).map(|l| &l.token)
     }
-}
 
-// Term := Unary (('*' | '/') Unary)*
-fn parse_term(i: Tokens) -> IResult<Tokens, Expr> {
-    let (mut i, mut lhs) = parse_unary(i)?;
-    loop {
-        let op = match i.first() {
-            Some(Token::Star) => BinOp::Mul,
-            Some(Token::Slash) => BinOp::Div,
-            _ => return Ok((i, lhs)),
-        };
-        let (rest, rhs) = parse_unary(Tokens(&i[1..]))?;
-        lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
-        i = rest;
-    }
-}
-
-// Unary := ('+' | '-') Unary | Power
-fn parse_unary(i: Tokens) -> IResult<Tokens, Expr> {
-    match i.first() {
-        Some(Token::Plus) => parse_unary(Tokens(&i[1..])),
-        Some(Token::Minus) => {
-            let (i, e) = parse_unary(Tokens(&i[1..]))?;
-            Ok((i, Expr::Neg(Box::new(e))))
+    fn eat(&mut self, t: &Token) -> bool {
+        let found = self.peek() == Some(t);
+        if found {
+            self.pos += 1;
         }
-        _ => parse_power(i),
+        found
     }
-}
 
-// Power := Atom ('^' Unary)?
-// right associative and tighter than unary minus: 2^3^2 = 2^(3^2), -2^2 = -(2^2)
-fn parse_power(i: Tokens) -> IResult<Tokens, Expr> {
-    let (i, base) = parse_atom(i)?;
-    match i.first() {
-        Some(Token::Caret) => {
-            let (i, exp) = parse_unary(Tokens(&i[1..]))?;
-            Ok((i, Expr::Bin(BinOp::Pow, Box::new(base), Box::new(exp))))
+    fn expect(&mut self, t: &Token, expected: &str) -> Result<(), String> {
+        if self.eat(t) {
+            Ok(())
+        } else {
+            self.error(expected)
         }
-        _ => Ok((i, base)),
+    }
+
+    // line of the next token (or of the last one, at end of file)
+    fn line(&self) -> usize {
+        self.input
+            .get(self.pos)
+            .or(self.input.last())
+            .map_or(1, |l| l.line)
+    }
+
+    fn error<T>(&self, expected: &str) -> Result<T, String> {
+        let found = match self.peek() {
+            Some(t) => t.to_string(),
+            None => "end of file".to_string(),
+        };
+        Err(format!(
+            "line {}: expected {expected}, found {found}",
+            self.line()
+        ))
+    }
+
+    // Cmd := IDENT '(' Args ')' SCRIPT
+    fn cmd(&mut self) -> Result<Command, String> {
+        let line = self.line();
+        let Some(Token::Ident(name)) = self.peek() else {
+            return self.error("a distribution name");
+        };
+        self.pos += 1;
+
+        self.expect(&Token::ParenLeft, &format!("`(` after `{name}`"))?;
+        let args = self.args()?;
+        self.expect(&Token::ParenRight, "`,` or `)`")?;
+        let expr = DistExpr {
+            name: name.clone(),
+            args,
+        };
+
+        let Some(Token::Script(script)) = self.peek() else {
+            return self.error(&format!(
+                "a script (`$ ...` or a `$$` block) after `{expr}`"
+            ));
+        };
+        self.pos += 1;
+
+        Ok(Command {
+            line,
+            expr,
+            script: script.clone(),
+        })
+    }
+
+    // Args := (Expr (',' Expr)*)?
+    fn args(&mut self) -> Result<Vec<Expr>, String> {
+        let mut args = Vec::new();
+        if self.peek() == Some(&Token::ParenRight) {
+            return Ok(args);
+        }
+        loop {
+            args.push(self.expr()?);
+            if !self.eat(&Token::Comma) {
+                return Ok(args);
+            }
+        }
+    }
+
+    // Expr := Term (('+' | '-') Term)*
+    fn expr(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.term()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::Plus) => BinOp::Add,
+                Some(Token::Minus) => BinOp::Sub,
+                _ => return Ok(lhs),
+            };
+            self.pos += 1;
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(self.term()?));
+        }
+    }
+
+    // Term := Unary (('*' | '/') Unary)*
+    fn term(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.unary()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::Star) => BinOp::Mul,
+                Some(Token::Slash) => BinOp::Div,
+                _ => return Ok(lhs),
+            };
+            self.pos += 1;
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(self.unary()?));
+        }
+    }
+
+    // Unary := ('+' | '-') Unary | Power
+    fn unary(&mut self) -> Result<Expr, String> {
+        if self.eat(&Token::Plus) {
+            self.unary()
+        } else if self.eat(&Token::Minus) {
+            Ok(Expr::Neg(Box::new(self.unary()?)))
+        } else {
+            self.power()
+        }
+    }
+
+    // Power := Atom ('^' Unary)?
+    // right associative and tighter than unary minus: 2^3^2 = 2^(3^2), -2^2 = -(2^2)
+    fn power(&mut self) -> Result<Expr, String> {
+        let base = self.atom()?;
+        if self.eat(&Token::Caret) {
+            let exp = self.unary()?;
+            Ok(Expr::Bin(BinOp::Pow, Box::new(base), Box::new(exp)))
+        } else {
+            Ok(base)
+        }
+    }
+
+    // Atom := NUM | '(' Expr ')'
+    fn atom(&mut self) -> Result<Expr, String> {
+        match self.peek() {
+            Some(Token::Num(n)) => {
+                self.pos += 1;
+                Ok(Expr::Num(*n))
+            }
+            Some(Token::ParenLeft) => {
+                self.pos += 1;
+                let e = self.expr()?;
+                self.expect(&Token::ParenRight, "`)`")?;
+                Ok(e)
+            }
+            _ => self.error("a number or `(`"),
+        }
     }
 }
 
-// Atom := NUM | '(' Expr ')'
-fn parse_atom(i: Tokens) -> IResult<Tokens, Expr> {
-    if let Ok((i, n)) = parse_t_num(i) {
-        return Ok((i, Expr::Num(n)));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file::lexer::tokenize;
+
+    fn parse_err(tab: &str) -> String {
+        parse(&tokenize(tab).unwrap()).unwrap_err()
     }
-    let (i, _) = parse_t_paren_left(i)?;
-    let (i, e) = parse_expr(i)?;
-    let (i, _) = parse_t_paren_right(i)?;
-    Ok((i, e))
-}
 
-// ==============
-// TOKEN MATCHERS
-// ==============
-
-fn parse_t_ident(i: Tokens) -> IResult<Tokens, String> {
-    match i.split_first() {
-        Some((Token::Ident(s), rest)) => Ok((Tokens(rest), s.clone())),
-        _ => Err(nom::Err::Error(nom::error::Error::new(i, ErrorKind::Tag))),
+    #[test]
+    fn syntax_errors() {
+        let cases = [
+            (
+                "exp(1/60 $ true",
+                "line 1: expected `,` or `)`, found script `true`",
+            ),
+            (
+                "\nexp 1 $ true",
+                "line 2: expected `(` after `exp`, found `1`",
+            ),
+            ("exp(1)\n\n", "line 1: expected a script"),
+            (
+                "exp(1) $ a\n(1) $ b",
+                "line 2: expected a distribution name, found `(`",
+            ),
+            (
+                "exp(1 +) $ a",
+                "line 1: expected a number or `(`, found `)`",
+            ),
+            ("exp((1 $ a", "line 1: expected `)`, found script `a`"),
+            (
+                "exp(",
+                "line 1: expected a number or `(`, found end of file",
+            ),
+        ];
+        for (tab, want) in cases {
+            let err = parse_err(tab);
+            assert!(err.starts_with(want), "{tab:?}: {err}");
+        }
     }
-}
 
-fn parse_t_num(i: Tokens) -> IResult<Tokens, f64> {
-    match i.split_first() {
-        Some((Token::Num(n), rest)) => Ok((Tokens(rest), *n)),
-        _ => Err(nom::Err::Error(nom::error::Error::new(i, ErrorKind::Tag))),
-    }
-}
-
-fn parse_t_script(i: Tokens) -> IResult<Tokens, String> {
-    match i.split_first() {
-        Some((Token::Script(s), rest)) => Ok((Tokens(rest), s.clone())),
-        _ => Err(nom::Err::Error(nom::error::Error::new(i, ErrorKind::Tag))),
-    }
-}
-
-fn parse_t_paren_left(i: Tokens) -> IResult<Tokens, ()> {
-    match i.split_first() {
-        Some((Token::ParenLeft, rest)) => Ok((Tokens(rest), ())),
-        _ => Err(nom::Err::Error(nom::error::Error::new(i, ErrorKind::Tag))),
-    }
-}
-
-fn parse_t_paren_right(i: Tokens) -> IResult<Tokens, ()> {
-    match i.split_first() {
-        Some((Token::ParenRight, rest)) => Ok((Tokens(rest), ())),
-        _ => Err(nom::Err::Error(nom::error::Error::new(i, ErrorKind::Tag))),
-    }
-}
-
-fn parse_t_comma(i: Tokens) -> IResult<Tokens, ()> {
-    match i.split_first() {
-        Some((Token::Comma, rest)) => Ok((Tokens(rest), ())),
-        _ => Err(nom::Err::Error(nom::error::Error::new(i, ErrorKind::Tag))),
+    #[test]
+    fn commands_know_their_line() {
+        let file = parse(&tokenize("# c\nexp(1) $ a\n\nexp(2) $$\n b\n$$").unwrap()).unwrap();
+        let lines: Vec<_> = file.cmds.iter().map(|c| c.line).collect();
+        assert_eq!(lines, [2, 4]);
     }
 }
