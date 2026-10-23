@@ -1,5 +1,8 @@
 # pcron: probabilistic cron
 
+[![crates.io](https://img.shields.io/crates/v/pcron)](https://crates.io/crates/pcron)
+[![CI](https://github.com/joaquin-rossi/pcron/actions/workflows/ci.yml/badge.svg)](https://github.com/joaquin-rossi/pcron/actions/workflows/ci.yml)
+
 Runs commands at random intervals: after each run, the delay until the next one is drawn from a probability distribution.
 
 Original idea: [https://news.ycombinator.com/item?id=46401425](https://news.ycombinator.com/item?id=46401425)
@@ -7,6 +10,7 @@ Original idea: [https://news.ycombinator.com/item?id=46401425](https://news.ycom
 ## Usage
 
 ```sh
+cargo install pcron
 pcron edit         # edit the tab
 pcron edit backup  # edit tab.d/backup.tab
 pcron list         # list the commands
@@ -58,6 +62,6 @@ Distributions: `beta(alpha, beta)`, `cauchy(median, scale)`, `chi_squared(k)`, `
 - `SIGHUP` reloads the tab: unchanged commands keep their timers, and an invalid tab is ignored.
 - `SIGTERM` / `SIGINT` stop it: running scripts get SIGTERM, and are killed after `PCRON_SHUTDOWN_TIMEOUT` or when their `PCRON_TIMEOUT` runs out, whichever comes first.
 
-`contrib/systemd/pcron.service` is a systemd user unit to run it.
+`contrib/systemd/pcron.service` is a systemd user unit to run it, and `contrib/example.tab` an example tab.
 
 See `pcron <command> --help` for all the options.
