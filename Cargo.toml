@@ -1,8 +1,13 @@
 [package]
 name = "pcron"
+description = "Probabilistic cron: run commands at random intervals drawn from probability distributions"
 authors = ["Joaquín Rossi"]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/joaquin-rossi/pcron"
+readme = "README.md"
 categories = ["command-line-utilities"]
 keywords = ["unix"]
 
@@ -16,5 +21,5 @@ rand = "0.9.3"
 rand_distr = "0.5.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokio = { version = "1.49.0", features = ["full"] }
+tokio = { version = "1.49.0", features = ["macros", "process", "rt-multi-thread", "time"] }
 whoami = "2.1.0"
