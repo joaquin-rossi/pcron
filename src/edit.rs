@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
-use rand::Rng;
+use rand::RngExt;
 use std::{
     env,
     fs::{self, File, OpenOptions},

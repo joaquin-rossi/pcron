@@ -1,13 +1,13 @@
 //! when commands run, shared by the server and `pcron list --simulate`
 
 use chrono::{DateTime, TimeDelta, Utc};
-use rand::RngCore;
+use rand::Rng;
 
 use crate::TabCmd;
 
 /// the next run of `cmd` after one at `from`: its delay is sampled (and clamped), and with
 /// a window it only counts while the window is open
-pub fn next_run(cmd: &TabCmd, from: DateTime<Utc>, rng: &mut dyn RngCore) -> (f64, DateTime<Utc>) {
+pub fn next_run(cmd: &TabCmd, from: DateTime<Utc>, rng: &mut dyn Rng) -> (f64, DateTime<Utc>) {
     let secs = cmd.settings.bounds.clamp(cmd.delay.sample_with(rng));
     let at = match &cmd.window {
         None => from + delta(secs),

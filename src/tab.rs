@@ -1,6 +1,6 @@
 //! what a tab is made of
 
-use rand::RngCore;
+use rand::Rng;
 use rand_distr::Distribution as RandDistribution;
 use std::{fmt, time::Duration};
 
@@ -116,7 +116,7 @@ pub enum Delay {
 }
 
 impl Delay {
-    pub fn sample_with(&self, rng: &mut dyn RngCore) -> f64 {
+    pub fn sample_with(&self, rng: &mut dyn Rng) -> f64 {
         match self {
             Delay::Const(v) => *v,
             Delay::Dist { dist, .. } => dist.sample_with(rng),
@@ -157,7 +157,7 @@ impl fmt::Display for Delay {
 }
 
 pub trait DistFloat: Send + Sync {
-    fn sample_with(&self, rng: &mut dyn RngCore) -> f64;
+    fn sample_with(&self, rng: &mut dyn Rng) -> f64;
 
     #[cfg(test)]
     fn sample(&self) -> f64 {
@@ -170,7 +170,7 @@ where
     D: RandDistribution<f64> + Send + Sync,
 {
     #[inline]
-    fn sample_with(&self, rng: &mut dyn RngCore) -> f64 {
+    fn sample_with(&self, rng: &mut dyn Rng) -> f64 {
         RandDistribution::sample(self, rng)
     }
 }
