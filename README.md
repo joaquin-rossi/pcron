@@ -58,4 +58,6 @@ Distributions: `beta(alpha, beta)`, `cauchy(median, scale)`, `chi_squared(k)`, `
 - `SIGHUP` reloads the tab: unchanged commands keep their timers, and an invalid tab is ignored.
 - `SIGTERM` / `SIGINT` stop it: running scripts get SIGTERM, and are killed after `PCRON_SHUTDOWN_TIMEOUT` or when their `PCRON_TIMEOUT` runs out, whichever comes first.
 
+`contrib/systemd/pcron.service` is a systemd user unit to run it.
+
 See `pcron <command> --help` for all the options.

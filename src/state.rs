@@ -17,7 +17,7 @@ use std::{
 };
 use tokio::sync::Notify;
 
-use pcron::{TabCmd, window::Window};
+use crate::{TabCmd, window::Window};
 
 /// identifies a command by its content, so that a reload (or a restart) can tell which
 /// ones did not change
@@ -177,7 +177,7 @@ impl Drop for TimerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pcron::file;
+    use crate::file;
 
     #[test]
     fn save_and_load() {

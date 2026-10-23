@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::{collections::BTreeMap, path::Path};
 
 use crate::state::{self, CmdKey};
-use pcron::{
+use crate::{
     Delay, DelayBounds, Settings, TabCmd, file, schedule,
     window::{Window, Zone},
 };

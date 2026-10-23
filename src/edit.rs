@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use crate::SHELL;
-use pcron::file;
+use crate::file;
 
 // like visudo: edit a copy, check it (with the rest of the tab), and only then put it in
 // place; `name` picks tab.d/NAME.tab instead of the tab file

@@ -23,7 +23,7 @@ use crate::{
     SHELL,
     state::{self, CmdKey, Saved, Timers},
 };
-use pcron::{Settings, Tab, TabCmd, file, schedule};
+use crate::{Settings, Tab, TabCmd, file, schedule};
 
 // longer lines of script output are cut
 const MAX_LINE: usize = 4096;

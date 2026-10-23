@@ -6,10 +6,16 @@ use clap::{CommandFactory, Parser, Subcommand};
 use std::{env, io, path::PathBuf};
 
 mod edit;
+mod file;
 mod list;
 mod man;
+mod schedule;
 mod server;
 mod state;
+mod tab;
+mod window;
+
+use tab::*;
 
 // the editor, and the scripts unless the tab sets SHELL, run with sh (whatever the
 // user's $SHELL is)

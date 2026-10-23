@@ -1,13 +1,13 @@
+//! what a tab is made of
+
 use rand::RngCore;
 use rand_distr::Distribution as RandDistribution;
 use std::{fmt, time::Duration};
 
-pub mod file;
-pub mod schedule;
-pub mod window;
-
-use file::parser::BinOp;
-use window::{Window, Zone};
+use crate::{
+    file::parser::BinOp,
+    window::{Window, Zone},
+};
 
 pub struct Tab {
     pub cmds: Vec<TabCmd>,
@@ -125,6 +125,7 @@ impl Delay {
         }
     }
 
+    #[cfg(test)]
     pub fn sample(&self) -> f64 {
         self.sample_with(&mut rand::rng())
     }
@@ -158,6 +159,7 @@ impl fmt::Display for Delay {
 pub trait DistFloat: Send + Sync {
     fn sample_with(&self, rng: &mut dyn RngCore) -> f64;
 
+    #[cfg(test)]
     fn sample(&self) -> f64 {
         self.sample_with(&mut rand::rng())
     }
