@@ -4,22 +4,26 @@ use nom::{
     IResult, Input, Needed, Parser,
     branch::alt,
     bytes::complete::{tag, take_while, take_while1},
-    character::complete::{char, line_ending, multispace0, space0},
-    combinator::{eof, map, recognize},
+    character::complete::{char, digit0, digit1, line_ending, multispace0, one_of, space0},
+    combinator::{eof, opt, recognize},
     error::{ErrorKind, ParseError},
     multi::many0,
-    number::complete::double,
     sequence::preceded,
 };
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Token {
+    Caret,
     Comma,
     Ident(String),
+    Minus,
     Num(f64),
     ParenLeft,
     ParenRight,
+    Plus,
     Script(String),
+    Slash,
+    Star,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -154,6 +158,7 @@ fn lex_token(i: &str) -> LexResult<'_, Token> {
             lex_comma,
             lex_ident,
             lex_num,
+            lex_op,
             lex_paren_left,
             lex_paren_right,
             lex_script,
@@ -196,8 +201,29 @@ fn lex_comma(i: &str) -> LexResult<'_, Token> {
     char(',').map(|_| Token::Comma).parse(i)
 }
 
+// unsigned: `1`, `1.5`, `1.`, `.5`, `1e-3` (signs are lexed as operators)
 fn lex_num(i: &str) -> LexResult<'_, Token> {
-    map(double, Token::Num).parse(i)
+    recognize((
+        alt((
+            recognize((digit1, opt((char('.'), digit0)))),
+            recognize((char('.'), digit1)),
+        )),
+        opt((one_of("eE"), opt(one_of("+-")), digit1)),
+    ))
+    .map(|s: &str| Token::Num(s.parse().expect("recognized float syntax")))
+    .parse(i)
+}
+
+// '+' | '-' | '*' | '/' | '^'
+fn lex_op(i: &str) -> LexResult<'_, Token> {
+    alt((
+        char('+').map(|_| Token::Plus),
+        char('-').map(|_| Token::Minus),
+        char('*').map(|_| Token::Star),
+        char('/').map(|_| Token::Slash),
+        char('^').map(|_| Token::Caret),
+    ))
+    .parse(i)
 }
 
 fn lex_ident(i: &str) -> LexResult<'_, Token> {
@@ -282,6 +308,28 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn numbers_and_operators() {
+        use Token::*;
+        assert_eq!(
+            tokenize("2-1 +.5*1e-3/ 1.^-x").unwrap(),
+            [
+                Num(2.0),
+                Minus,
+                Num(1.0),
+                Plus,
+                Num(0.5),
+                Star,
+                Num(1e-3),
+                Slash,
+                Num(1.0),
+                Caret,
+                Minus,
+                Ident("x".to_string()),
+            ]
+        );
     }
 
     #[test]

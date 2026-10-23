@@ -2,8 +2,9 @@ pub mod lexer;
 pub mod parser;
 
 use crate::{DistFloat, Tab, TabCmd};
+use parser::{BinOp, Expr};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::{fs, path::Path};
 
 pub fn read(path: impl AsRef<Path>) -> Result<Tab> {
@@ -21,7 +22,13 @@ pub fn parse(text: &str) -> Result<Tab> {
         .cmds
         .into_iter()
         .map(|cmd| {
-            let dist = build_dyn_distf32(&cmd.expr.name, &cmd.expr.args)
+            let dist = cmd
+                .expr
+                .args
+                .iter()
+                .map(eval_arg)
+                .collect::<Result<Vec<_>>>()
+                .and_then(|args| build_dyn_distf32(&cmd.expr.name, &args))
                 .with_context(|| format!("in `{}`", cmd.expr))?;
             Ok(TabCmd {
                 dist,
@@ -31,6 +38,35 @@ pub fn parse(text: &str) -> Result<Tab> {
         .collect::<Result<Vec<_>>>()?;
 
     Ok(Tab { cmds })
+}
+
+// arguments are evaluated as f64 and must end up finite and non-negative
+fn eval_arg(e: &Expr) -> Result<f32> {
+    let v = eval(e)?;
+    ensure!(v >= 0.0, "`{e}` is negative ({v})");
+    let v = v as f32;
+    ensure!(v.is_finite(), "`{e}` is too large");
+    Ok(v)
+}
+
+// every intermediate result must be finite (catches 1/0, 0^-1, (-8)^(1/3), ...)
+fn eval(e: &Expr) -> Result<f64> {
+    let v = match e {
+        Expr::Num(n) => *n,
+        Expr::Neg(x) => -eval(x)?,
+        Expr::Bin(op, l, r) => {
+            let (l, r) = (eval(l)?, eval(r)?);
+            match op {
+                BinOp::Add => l + r,
+                BinOp::Sub => l - r,
+                BinOp::Mul => l * r,
+                BinOp::Div => l / r,
+                BinOp::Pow => l.powf(r),
+            }
+        }
+    };
+    ensure!(v.is_finite(), "`{e}` is not a finite number ({v})");
+    Ok(v)
 }
 
 // - beta(alpha, beta)
@@ -178,6 +214,47 @@ mod tests {
     fn pert_args_are_min_max_mode_shape() {
         // mode=1 is inside [0, 10]; with mode and shape swapped it would be out of range
         build_dyn_distf32("pert", &[0.0, 10.0, 1.0, 20.0]).unwrap();
+    }
+
+    fn eval_str(arg: &str) -> Result<f64> {
+        let tokens = lexer::tokenize(&format!("x({arg}) $ true")).unwrap();
+        let ast = parser::parse(&tokens).unwrap();
+        eval(&ast.cmds[0].expr.args[0])
+    }
+
+    #[test]
+    fn arithmetic() {
+        let cases = [
+            ("1/60", 1.0 / 60.0),
+            ("1 + 2 * 3", 7.0),
+            ("(1 + 2) * 3", 9.0),
+            ("10 - 4 - 3", 3.0),
+            ("8 / 4 / 2", 1.0),
+            ("2^3^2", 512.0),
+            ("-2^2", -4.0),
+            ("2^-1", 0.5),
+            ("+3 - -2", 5.0),
+            ("1.5e2", 150.0),
+        ];
+        for (arg, want) in cases {
+            assert_eq!(eval_str(arg).unwrap(), want, "{arg}");
+        }
+    }
+
+    #[test]
+    fn non_finite_is_an_error() {
+        for arg in ["1/0", "0^-1", "(-8)^(1/3)", "0/0", "1e400"] {
+            let err = format!("{:#}", eval_str(arg).unwrap_err());
+            assert!(err.contains("not a finite number"), "{arg}: {err}");
+        }
+    }
+
+    #[test]
+    fn arg_must_be_non_negative_f32() {
+        let err = |tab: &str| format!("{:#}", parse(tab).err().unwrap());
+        assert!(err("exp(1 - 2) $ true").contains("`1 - 2` is negative"));
+        assert!(err("exp(10^39) $ true").contains("too large"));
+        parse("exp(1/60) $ true\nnormal(-1 + 2, 0) $ true").unwrap();
     }
 
     #[test]
