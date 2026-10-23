@@ -1,5 +1,5 @@
 use crate::file::lexer::{Lexeme, Token};
-use std::{fmt, ops::Range};
+use std::{collections::BTreeMap, fmt, ops::Range};
 
 #[derive(Debug)]
 pub struct File {
@@ -9,6 +9,8 @@ pub struct File {
 #[derive(Debug)]
 pub struct Command {
     pub line: usize,
+    /// the `NAME=value` lines above the command (later ones win), sorted by name
+    pub env: Vec<(String, String)>,
     /// byte range of the distribution in the tab
     pub span: Range<usize>,
     pub expr: DistExpr,
@@ -74,8 +76,16 @@ impl fmt::Display for BinOp {
 pub fn parse(input: &[Lexeme]) -> Result<File, String> {
     let mut p = Parser { input, pos: 0 };
     let mut cmds = Vec::new();
-    while p.peek().is_some() {
-        cmds.push(p.cmd()?);
+    let mut env = BTreeMap::new();
+    while let Some(t) = p.peek() {
+        if let Token::Env(name, value) = t {
+            env.insert(name.clone(), value.clone());
+            p.pos += 1;
+            continue;
+        }
+        let mut cmd = p.cmd()?;
+        cmd.env = env.clone().into_iter().collect();
+        cmds.push(cmd);
     }
     Ok(File { cmds })
 }
@@ -152,6 +162,7 @@ impl<'a> Parser<'a> {
 
         Ok(Command {
             line,
+            env: Vec::new(),
             span,
             expr,
             script: script.clone(),
@@ -280,6 +291,18 @@ mod tests {
             let err = parse_err(tab);
             assert!(err.starts_with(want), "{tab:?}: {err}");
         }
+    }
+
+    #[test]
+    fn env_applies_to_the_commands_below() {
+        let tab = "exp(1) $ a\nA=1\nB=2\nexp(1) $ b\nA=3\nexp(1) $ c";
+        let file = parse(&tokenize(tab).unwrap()).unwrap();
+        let env: Vec<Vec<_>> = file
+            .cmds
+            .iter()
+            .map(|c| c.env.iter().map(|(k, v)| format!("{k}={v}")).collect())
+            .collect();
+        assert_eq!(env, [vec![], vec!["A=1", "B=2"], vec!["A=3", "B=2"]]);
     }
 
     #[test]

@@ -31,7 +31,8 @@ $$
 
 - `$ ...` runs the rest of the line; a `$$` block ends at a line containing only `$$`.
 - Arguments can use `+ - * / ^` and parentheses, and must be non-negative.
-- Scripts run with `/bin/sh -lc`. A run starts even if the previous one is still going, like cron.
+- Scripts run with `$SHELL -c`, where `SHELL` can be set in the tab (`/bin/sh` by default). A run starts even if the previous one is still going, like cron.
+- `NAME=value` lines set environment variables for the commands below them (no `$` expansion, like cron).
 - `#` starts a comment.
 
 Distributions: `beta(alpha, beta)`, `cauchy(median, scale)`, `chi_squared(k)`, `const(value)`, `exp(lambda)`, `exp1()`, `fisher_f(m, n)`, `frechet(location, scale, shape)`, `gamma(shape, scale)`, `gumbel(location, scale)`, `inverse_gaussian(mean, shape)`, `log_normal(mu, sigma)`, `normal(mean, std_dev)`, `normal_inverse_gaussian(alpha, beta)`, `pareto(scale, shape)`, `pert(min, max, mode, shape)`, `poisson(lambda)`, `skew_normal(location, scale, shape)`, `standard_normal()`, `standard_uniform()`, `student_t(nu)`, `triangular(min, max, mode)`, `uniform(min, max)`, `weibull(scale, shape)`.

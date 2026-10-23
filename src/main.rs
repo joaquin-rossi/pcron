@@ -9,7 +9,8 @@ mod edit;
 mod list;
 mod server;
 
-// scripts and the editor always run with sh, whatever the user's $SHELL is
+// the editor, and the scripts unless the tab sets SHELL, run with sh (whatever the
+// user's $SHELL is)
 const SHELL: &str = "/bin/sh";
 
 #[derive(Debug, Parser)]

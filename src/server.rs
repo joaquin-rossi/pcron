@@ -148,6 +148,7 @@ async fn shutdown(ctx: &Ctx, grace: Duration, reason: &str, term: &mut Signal, i
 struct CmdKey {
     name: String,
     args: Vec<u64>,
+    env: Vec<(String, String)>,
     script: String,
 }
 
@@ -157,6 +158,7 @@ impl CmdKey {
             name: cmd.name.clone(),
             // `+ 0.0` turns -0 into 0, so that both get the same bits
             args: cmd.args.iter().map(|a| (a + 0.0).to_bits()).collect(),
+            env: cmd.env.clone(),
             script: cmd.script.clone(),
         }
     }
@@ -215,6 +217,8 @@ async fn server_handle_cmd(tab_cmd: TabCmd, ctx: Arc<Ctx>) {
         log_script.push_str(" ; ...");
     }
 
+    let shell = script_shell(&tab_cmd.env);
+
     loop {
         let sleep_delay = ctx.bounds.delay(tab_cmd.dist.sample());
         log_cmd(
@@ -223,9 +227,11 @@ async fn server_handle_cmd(tab_cmd: TabCmd, ctx: Arc<Ctx>) {
         );
         sleep(sleep_delay).await;
 
-        let mut cmd = Command::new(SHELL);
-        cmd.arg("-lc");
+        let mut cmd = Command::new(shell);
+        cmd.arg("-c");
         cmd.arg(&tab_cmd.script);
+        cmd.envs(tab_cmd.env.iter().map(|(k, v)| (k, v)));
+        cmd.env("SHELL", shell);
         cmd.stdin(Stdio::null());
         match ctx.output {
             Output::Log => cmd.stdout(Stdio::piped()).stderr(Stdio::piped()),
@@ -239,7 +245,7 @@ async fn server_handle_cmd(tab_cmd: TabCmd, ctx: Arc<Ctx>) {
             Err(e) => {
                 log_cmd(
                     &log_script,
-                    &format!("CMD_ERROR(cannot spawn `{SHELL}`: {e})"),
+                    &format!("CMD_ERROR(cannot spawn `{shell}`: {e})"),
                 );
                 continue;
             }
@@ -258,6 +264,13 @@ async fn server_handle_cmd(tab_cmd: TabCmd, ctx: Arc<Ctx>) {
         // not part of the loop task: a reload that stops the loop lets the script finish
         tokio::spawn(watch_child(proc, pid, log_script.clone(), ctx.clone()));
     }
+}
+
+// like cron: SHELL from the tab, or /bin/sh
+fn script_shell(env: &[(String, String)]) -> &str {
+    env.iter()
+        .find(|(k, v)| k == "SHELL" && !v.is_empty())
+        .map_or(SHELL, |(_, v)| v)
 }
 
 async fn watch_child(mut proc: Child, pid: u32, log_script: String, ctx: Arc<Ctx>) {
@@ -406,6 +419,14 @@ mod tests {
         file::parse(tab).unwrap().cmds
     }
 
+    #[test]
+    fn shell() {
+        let shell = |tab| script_shell(&cmds(tab)[0].env).to_string();
+        assert_eq!(shell("const(1) $ a"), "/bin/sh");
+        assert_eq!(shell("SHELL=/bin/bash\nconst(1) $ a"), "/bin/bash");
+        assert_eq!(shell("SHELL=\nconst(1) $ a"), "/bin/sh");
+    }
+
     #[tokio::test]
     async fn reload_matches_commands_by_content() {
         let ctx = Arc::new(Ctx {
@@ -429,5 +450,9 @@ mod tests {
 
         let s = loops.sync(cmds("const(1) $ c"), &ctx);
         assert_eq!((s.kept, s.started, s.stopped), (1, 0, 3));
+
+        // the same command with another environment is a different command
+        let s = loops.sync(cmds("X=1\nconst(1) $ c"), &ctx);
+        assert_eq!((s.kept, s.started, s.stopped), (0, 1, 1));
     }
 }

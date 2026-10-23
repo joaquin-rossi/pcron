@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Args;
 use rand::{SeedableRng, rngs::StdRng};
 use serde::Serialize;
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use crate::{DelayArgs, DelayBounds};
 use pcron::{DistFloat, TabCmd, file};
@@ -51,6 +51,7 @@ struct JsonCmd<'a> {
     definition: &'a str,
     distribution: &'a str,
     args: &'a [f64],
+    env: BTreeMap<&'a str, &'a str>,
     /// in seconds
     delay: &'a Stats,
 }
@@ -68,6 +69,11 @@ fn print_json(cmds: &[TabCmd], stats: &[Stats], bounds: DelayBounds) -> Result<(
                 definition: &cmd.source,
                 distribution: &cmd.name,
                 args: &cmd.args,
+                env: cmd
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect(),
                 delay,
             })
             .collect(),

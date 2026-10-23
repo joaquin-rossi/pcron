@@ -15,6 +15,8 @@ pub struct TabCmd {
     pub name: String,
     pub args: Vec<f64>,
     pub dist: Box<dyn DistFloat>,
+    /// set for the script, on top of the server's environment
+    pub env: Vec<(String, String)>,
     pub script: String,
 }
 

@@ -45,6 +45,7 @@ pub fn parse(text: &str) -> Result<Tab> {
                 name: cmd.expr.name,
                 args,
                 dist,
+                env: cmd.env,
                 script: cmd.script,
             })
         })

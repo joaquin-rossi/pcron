@@ -14,6 +14,8 @@ use nom::{
 pub enum Token {
     Caret,
     Comma,
+    /// `NAME=value`
+    Env(String, String),
     Ident(String),
     Minus,
     Num(f64),
@@ -30,6 +32,7 @@ impl fmt::Display for Token {
         match self {
             Token::Caret => f.write_str("`^`"),
             Token::Comma => f.write_str("`,`"),
+            Token::Env(name, value) => write!(f, "assignment `{name}={value}`"),
             Token::Ident(s) => write!(f, "`{s}`"),
             Token::Minus => f.write_str("`-`"),
             Token::Num(n) => write!(f, "`{n}`"),
@@ -123,6 +126,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Lexeme>, String> {
 fn lex_token(i: &str) -> LexResult<'_, Token> {
     alt((
         lex_comma,
+        lex_env,
         lex_ident,
         lex_num,
         lex_op,
@@ -190,6 +194,24 @@ fn lex_op(i: &str) -> LexResult<'_, Token> {
         char('^').map(|_| Token::Caret),
     ))
     .parse(i)
+}
+
+// NAME = value, up to the end of the line; quotes around the value keep its outer blanks
+fn lex_env(i: &str) -> LexResult<'_, Token> {
+    let (i, name) = recognize((
+        take_while1(|c: char| c == '_' || c.is_ascii_alphabetic()),
+        take_while(|c: char| c == '_' || c.is_ascii_alphanumeric()),
+    ))
+    .parse(i)?;
+    let (i, _) = (space0, char('=')).parse(i)?;
+    let (i, value) = take_while(|c| c != '\n').parse(i)?;
+
+    let value = value.trim();
+    let value = ['"', '\'']
+        .into_iter()
+        .find_map(|q| value.strip_prefix(q)?.strip_suffix(q))
+        .unwrap_or(value);
+    Ok((i, Token::Env(name.to_string(), value.to_string())))
 }
 
 fn lex_ident(i: &str) -> LexResult<'_, Token> {
@@ -311,6 +333,29 @@ mod tests {
             .map(|l| l.line)
             .collect();
         assert_eq!(lines, [2, 2, 2, 2, 2, 7, 7, 7, 7, 8]);
+    }
+
+    #[test]
+    fn env_assignments() {
+        let toks: Vec<_> = tokenize(
+            "A=1\nB = two words # not a comment\nC=\"  quoted \"\nD=''\nE=\nexp(1) $ F=x env\n",
+        )
+        .unwrap()
+        .into_iter()
+        .map(|l| l.token)
+        .collect();
+        let env = |n: &str, v: &str| Token::Env(n.to_string(), v.to_string());
+        assert_eq!(
+            toks[..5],
+            [
+                env("A", "1"),
+                env("B", "two words # not a comment"),
+                env("C", "  quoted "),
+                env("D", ""),
+                env("E", ""),
+            ]
+        );
+        assert_eq!(toks.last(), Some(&Token::Script("F=x env".to_string())));
     }
 
     #[test]
