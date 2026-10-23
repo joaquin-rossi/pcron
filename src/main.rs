@@ -9,6 +9,7 @@ mod edit;
 mod list;
 mod man;
 mod server;
+mod state;
 
 // the editor, and the scripts unless the tab sets SHELL, run with sh (whatever the
 // user's $SHELL is)

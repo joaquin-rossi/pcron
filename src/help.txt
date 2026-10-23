@@ -20,22 +20,30 @@ TAB FORMAT:
   - name: before the delay labels the command in the logs and in pcron list.
     Names are optional, and unique.
   - @ days hours makes the delay count only while that window is open, in
-    local time: days like mon-fri or sat,sun, hours like 9-18 or
-    9:30-12,14-18 (either can be left out).
+    local time (or PCRON_TZ): days like mon-fri or sat,sun, hours like 9-18
+    or 9:30-12,14-18 (either can be left out).
   - $ ... runs the rest of the line; a $$ block ends at a line
     containing only $$.
   - NAME=value lines set environment variables for the commands below them,
     up to the end of the line; quotes keep the outer blanks, and $ is not
     expanded.
   - Some variables configure pcron instead of the script (which doesn't get
-    them), also for the commands below them; their values are in seconds
-    and can use arithmetic, and empty means the default:
+    them), also for the commands below them; times are in seconds and can
+    use arithmetic, and empty means the default:
 
       PCRON_MIN_DELAY=1          every sampled delay is at least this
       PCRON_MAX_DELAY=31536000   and at most this (a year)
       PCRON_TIMEOUT=             SIGTERM after running this long (empty or
                                  0: no limit)
       PCRON_SHUTDOWN_TIMEOUT=60  SIGKILL this long after SIGTERM
+      PCRON_TZ=                  time zone of the windows, like Europe/Madrid
+                                 (empty: local)
+      PCRON_ON_FAILURE=          a script to run when the script exits with
+                                 an error, is killed or times out, or cannot
+                                 start; it gets PCRON_NAME, PCRON_SCRIPT,
+                                 PCRON_REASON (exit, signal, timeout or
+                                 spawn), PCRON_EXIT, PCRON_SIGNAL and
+                                 PCRON_OUTPUT (its last 20 lines)
 
   - Scripts run with $SHELL -c, where SHELL can be set in the tab
     (/bin/sh by default). A run starts even if the previous one is still
@@ -66,3 +74,5 @@ SIGNALS:
 
 FILES:
   $XDG_CONFIG_HOME/pcron/tab (or ~/.config/pcron/tab) is the default tab.
+  $XDG_STATE_HOME/pcron/ (or ~/.local/state/pcron/) keeps the next run of each
+  command, so that a restart resumes them (and a missed one runs right away).

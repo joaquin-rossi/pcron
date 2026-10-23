@@ -3,10 +3,11 @@ use rand_distr::Distribution as RandDistribution;
 use std::{fmt, time::Duration};
 
 pub mod file;
+pub mod schedule;
 pub mod window;
 
 use file::parser::BinOp;
-use window::Window;
+use window::{Window, Zone};
 
 pub struct Tab {
     pub cmds: Vec<TabCmd>,
@@ -29,13 +30,17 @@ pub struct TabCmd {
 }
 
 /// the PCRON_ variables of the tab, which can change from one command to the next
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub bounds: DelayBounds,
     /// how long a script may run before it is asked to stop
     pub timeout: Option<Duration>,
     /// how long a script gets to stop (after SIGTERM) before it is killed
     pub shutdown_timeout: Duration,
+    /// of the window
+    pub tz: Zone,
+    /// a script to run when the command fails
+    pub on_failure: Option<String>,
 }
 
 impl Default for Settings {
@@ -47,6 +52,8 @@ impl Default for Settings {
             },
             timeout: None,
             shutdown_timeout: Duration::from_secs(60),
+            tz: Zone::Local,
+            on_failure: None,
         }
     }
 }

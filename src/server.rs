@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, anyhow, ensure};
+use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::{self, Write},
     os::unix::process::ExitStatusExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
@@ -18,12 +19,16 @@ use tokio::{
     time::{Instant, sleep, sleep_until, timeout},
 };
 
-use crate::SHELL;
-use chrono::NaiveDateTime;
-use pcron::{Settings, Tab, TabCmd, file, window::Window};
+use crate::{
+    SHELL,
+    state::{self, CmdKey, Saved, Timers},
+};
+use pcron::{Settings, Tab, TabCmd, file, schedule};
 
 // longer lines of script output are cut
 const MAX_LINE: usize = 4096;
+// the last lines of output that PCRON_ON_FAILURE gets
+const TAIL_LINES: usize = 20;
 
 #[derive(Args, Debug)]
 pub struct ServerArgs {
@@ -45,6 +50,7 @@ struct Ctx {
     children: Children,
     /// what the running scripts should do; each one stops (or is killed) on its own
     phase: watch::Sender<Phase>,
+    timers: Arc<Timers>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,15 +70,35 @@ pub async fn main_server(tab_path: &Path, args: &ServerArgs) -> Result<()> {
     let mut term = listen(SignalKind::terminate(), "SIGTERM")?;
     let mut int = listen(SignalKind::interrupt(), "SIGINT")?;
 
+    let state_path = state::path(tab_path);
+    let mut saved = match &state_path {
+        Some(path) => state::load(path).unwrap_or_else(|e| {
+            log_line(&format!("TIMERS_ERROR({e:#}; starting over)"));
+            Saved::new()
+        }),
+        None => {
+            log_line("TIMERS_ERROR(neither $XDG_STATE_HOME nor $HOME is set; not saving them)");
+            Saved::new()
+        }
+    };
+
     let ctx = Arc::new(Ctx {
         output: args.output,
         children: Children::default(),
         phase: watch::Sender::new(Phase::Running),
+        timers: Arc::default(),
     });
     let mut loops = Loops::default();
-    let n = tab.cmds.len();
-    loops.sync(tab.cmds, &ctx);
-    log_line(&format!("START(commands={n})"));
+    log_line(&format!("START(commands={})", tab.cmds.len()));
+    loops.sync(tab.cmds, &ctx, &mut saved);
+
+    let saver = state_path.clone().map(|path| {
+        tokio::spawn(save_timers(
+            ctx.timers.clone(),
+            path,
+            tab_path.to_path_buf(),
+        ))
+    });
 
     let result = loop {
         tokio::select! {
@@ -84,7 +110,7 @@ pub async fn main_server(tab_path: &Path, args: &ServerArgs) -> Result<()> {
             },
             _ = hup.recv() => match read_tab(tab_path) {
                 Ok(tab) => {
-                    let s = loops.sync(tab.cmds, &ctx);
+                    let s = loops.sync(tab.cmds, &ctx, &mut Saved::new());
                     log_line(&format!(
                         "RELOAD(kept={}, started={}, stopped={})",
                         s.kept, s.started, s.stopped
@@ -97,13 +123,34 @@ pub async fn main_server(tab_path: &Path, args: &ServerArgs) -> Result<()> {
         }
     };
 
+    // save the timers as they are now: stopping the loops forgets them
+    if let Some(saver) = saver {
+        saver.abort();
+    }
+    if let Some(path) = &state_path {
+        if let Err(e) = ctx.timers.save(path, tab_path) {
+            log_line(&format!("TIMERS_ERROR({e:#})"));
+        }
+    }
     loops.set.abort_all();
+
     let reason = match &result {
         Ok(signal) => signal,
         Err(_) => "crash",
     };
     shutdown(&ctx, reason, &mut term, &mut int).await;
     result.map(|_| ())
+}
+
+// at most once a second, however often they change
+async fn save_timers(timers: Arc<Timers>, path: PathBuf, tab: PathBuf) {
+    loop {
+        timers.changed.notified().await;
+        sleep(Duration::from_secs(1)).await;
+        if let Err(e) = timers.save(&path, &tab) {
+            log_line(&format!("TIMERS_ERROR({e:#})"));
+        }
+    }
 }
 
 fn read_tab(tab_path: &Path) -> Result<Tab> {
@@ -141,29 +188,6 @@ async fn shutdown(ctx: &Ctx, reason: &str, term: &mut Signal, int: &mut Signal) 
     log_line("SHUTDOWN(done)");
 }
 
-/// identifies a command by its content, so that a reload can tell which ones did not change
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct CmdKey {
-    name: Option<String>,
-    /// with the constants evaluated (and printed in full), so `2*30` and `60` are the same
-    delay: String,
-    window: Option<String>,
-    env: Vec<(String, String)>,
-    script: String,
-}
-
-impl CmdKey {
-    fn new(cmd: &TabCmd) -> Self {
-        Self {
-            name: cmd.name.clone(),
-            delay: cmd.delay.to_string(),
-            window: cmd.window.as_ref().map(Window::to_string),
-            env: cmd.env.clone(),
-            script: cmd.script.clone(),
-        }
-    }
-}
-
 #[derive(Default)]
 struct Loops {
     set: JoinSet<()>,
@@ -179,8 +203,9 @@ struct SyncStats {
 
 impl Loops {
     // make the running loops match `cmds`: unchanged commands keep their loop (and timer),
-    // repeated commands are matched by count
-    fn sync(&mut self, cmds: Vec<TabCmd>, ctx: &Arc<Ctx>) -> SyncStats {
+    // repeated commands are matched by count; new ones take their timer from `saved` if
+    // it has one
+    fn sync(&mut self, cmds: Vec<TabCmd>, ctx: &Arc<Ctx>, saved: &mut Saved) -> SyncStats {
         let mut wanted: HashMap<CmdKey, Vec<TabCmd>> = HashMap::new();
         for cmd in cmds {
             wanted.entry(CmdKey::new(&cmd)).or_default().push(cmd);
@@ -198,10 +223,12 @@ impl Loops {
         });
 
         for (key, cmds) in wanted {
-            let handles = self.by_key.entry(key).or_default();
+            let handles = self.by_key.entry(key.clone()).or_default();
             let have = handles.len();
             for cmd in cmds.into_iter().skip(have) {
-                handles.push(self.set.spawn(server_handle_cmd(cmd, ctx.clone())));
+                let resume = saved.get_mut(&key).and_then(Vec::pop);
+                let run = server_handle_cmd(cmd, key.clone(), resume, ctx.clone());
+                handles.push(self.set.spawn(run));
                 stats.started += 1;
             }
         }
@@ -210,105 +237,104 @@ impl Loops {
     }
 }
 
-async fn server_handle_cmd(tab_cmd: TabCmd, ctx: Arc<Ctx>) {
-    // the name if it has one, or else the start of the script
-    let log_script = tab_cmd.name.clone().unwrap_or_else(|| {
-        let mut script_lines = tab_cmd.script.lines();
-        let mut start = script_lines.next().unwrap_or_default().trim().to_string();
-        if script_lines.next().is_some() {
-            start.push_str(" ; ...");
-        }
-        start
-    });
+/// what a command runs: its script, and its PCRON_ON_FAILURE when that fails
+struct Job {
+    /// for the logs: the name, or else the start of the script
+    label: String,
+    name: Option<String>,
+    script: String,
+    shell: String,
+    /// without the PCRON_ settings
+    env: Vec<(String, String)>,
+    settings: Settings,
+}
 
-    let shell = script_shell(&tab_cmd.env);
-
-    loop {
-        let secs = tab_cmd.settings.bounds.clamp(tab_cmd.delay.sample());
-        match &tab_cmd.window {
-            None => {
-                log_cmd(&log_script, &format!("SLEEP({secs:.3}s)"));
-                sleep(Duration::from_secs_f64(secs)).await;
+impl Job {
+    fn new(cmd: &TabCmd) -> Self {
+        let label = cmd.name.clone().unwrap_or_else(|| {
+            let mut lines = cmd.script.lines();
+            let mut start = lines.next().unwrap_or_default().trim().to_string();
+            if lines.next().is_some() {
+                start.push_str(" ; ...");
             }
-            Some(window) => {
-                let until = window.advance(local_now(), secs);
-                log_cmd(
-                    &log_script,
-                    &format!(
-                        "SLEEP({secs:.3}s in @ {window}, until {})",
-                        until.format("%b %d %H:%M:%S")
-                    ),
-                );
-                sleep_in_window(window, until).await;
-            }
-        }
-
-        let mut cmd = Command::new(shell);
-        cmd.arg("-c");
-        cmd.arg(&tab_cmd.script);
-        cmd.envs(
-            tab_cmd
+            start
+        });
+        Self {
+            label,
+            name: cmd.name.clone(),
+            script: cmd.script.clone(),
+            shell: script_shell(&cmd.env).to_string(),
+            env: cmd
                 .env
                 .iter()
                 .filter(|(k, _)| !file::SETTINGS.contains(&k.as_str()))
-                .map(|(k, v)| (k, v)),
-        );
-        cmd.env("SHELL", shell);
-        cmd.stdin(Stdio::null());
-        match ctx.output {
-            Output::Log => cmd.stdout(Stdio::piped()).stderr(Stdio::piped()),
-            Output::Discard => cmd.stdout(Stdio::null()).stderr(Stdio::null()),
-        };
-        // own process group, so that signals reach whatever the script started too
-        cmd.process_group(0);
-
-        let proc = match cmd.spawn() {
-            Ok(proc) => proc,
-            Err(e) => {
-                log_cmd(
-                    &log_script,
-                    &format!("CMD_ERROR(cannot spawn `{shell}`: {e})"),
-                );
-                continue;
-            }
-        };
-        let Some(pid) = proc.id() else {
-            log_cmd(
-                &log_script,
-                "CMD_ERROR(the script exited before it got a pid)",
-            );
-            continue;
-        };
-        // registered before any await, so that an abort cannot leave it untracked
-        ctx.children.insert(pid);
-        log_cmd(&log_script, &format!("CMD_START(pid={pid})"));
-
-        // not part of the loop task: a reload that stops the loop lets the script finish
-        tokio::spawn(watch_child(
-            proc,
-            pid,
-            log_script.clone(),
-            tab_cmd.settings,
-            ctx.clone(),
-        ));
+                .cloned()
+                .collect(),
+            settings: cmd.settings.clone(),
+        }
     }
 }
 
-fn local_now() -> NaiveDateTime {
-    chrono::Local::now().naive_local()
+async fn server_handle_cmd(
+    cmd: TabCmd,
+    key: CmdKey,
+    mut resume: Option<DateTime<Utc>>,
+    ctx: Arc<Ctx>,
+) {
+    let job = Arc::new(Job::new(&cmd));
+    let timer = ctx.timers.register(key);
+    let mut from = Utc::now();
+
+    loop {
+        let until = match resume.take() {
+            Some(until) if until <= Utc::now() => {
+                let missed = until
+                    .with_timezone(&chrono::Local)
+                    .format("%b %d %Y %H:%M:%S");
+                log_cmd(&job.label, &format!("RESUME(missed {missed}, running now)"));
+                until
+            }
+            Some(until) => {
+                log_cmd(&job.label, &format!("RESUME(until {})", fmt_time(until)));
+                until
+            }
+            None => {
+                let (secs, until) = schedule::next_run(&cmd, from, &mut rand::rng());
+                let window = cmd
+                    .window
+                    .as_ref()
+                    .map_or(String::new(), |w| format!(" in @ {w}"));
+                log_cmd(
+                    &job.label,
+                    &format!("SLEEP({secs:.3}s{window}, until {})", fmt_time(until)),
+                );
+                until
+            }
+        };
+        timer.set(until);
+        from = wait_until(&cmd, until).await;
+        start(&job, None, &ctx);
+    }
 }
 
-// in short steps, so that a suspend or a clock change can't throw it off; and if it ends up
-// outside the window anyway (say, waking up from a suspend at night), until it opens again
-async fn sleep_in_window(window: &Window, mut until: NaiveDateTime) {
+fn fmt_time(t: DateTime<Utc>) -> String {
+    t.with_timezone(&chrono::Local)
+        .format("%b %d %H:%M:%S")
+        .to_string()
+}
+
+// in short steps, so that a suspend or a clock change can't throw it off; with a window,
+// until it is open too (say, after waking up from a suspend at night); returns when
+async fn wait_until(cmd: &TabCmd, mut until: DateTime<Utc>) -> DateTime<Utc> {
     const STEP: Duration = Duration::from_secs(60);
     loop {
-        let now = local_now();
+        let now = Utc::now();
         if now >= until {
-            if window.contains(now) {
-                return;
+            let open = schedule::open_at(cmd, now);
+            if open <= now {
+                return now;
             }
-            until = window.advance(now, 0.0);
+            until = open;
             continue;
         }
         let left = (until - now).to_std().unwrap_or_default();
@@ -323,27 +349,120 @@ fn script_shell(env: &[(String, String)]) -> &str {
         .map_or(SHELL, |(_, v)| v)
 }
 
+/// why a script failed, for its PCRON_ON_FAILURE
+struct Failure {
+    /// exit, signal, timeout or spawn
+    reason: &'static str,
+    exit: Option<i32>,
+    signal: Option<i32>,
+    output: String,
+}
+
+// the script of `job`, or its PCRON_ON_FAILURE if there is a failure
+fn start(job: &Arc<Job>, failure: Option<Failure>, ctx: &Arc<Ctx>) {
+    let (text, prefix) = match &failure {
+        None => (job.script.as_str(), "CMD"),
+        Some(_) => match &job.settings.on_failure {
+            Some(hook) => (hook.as_str(), "HOOK"),
+            None => return,
+        },
+    };
+
+    let mut cmd = Command::new(&job.shell);
+    cmd.arg("-c");
+    cmd.arg(text);
+    cmd.envs(job.env.iter().map(|(k, v)| (k, v)));
+    cmd.env("SHELL", &job.shell);
+    if let Some(f) = &failure {
+        let number = |n: Option<i32>| n.map(|n| n.to_string()).unwrap_or_default();
+        cmd.env("PCRON_NAME", job.name.as_deref().unwrap_or_default());
+        cmd.env("PCRON_SCRIPT", &job.script);
+        cmd.env("PCRON_REASON", f.reason);
+        cmd.env("PCRON_EXIT", number(f.exit));
+        cmd.env("PCRON_SIGNAL", number(f.signal));
+        cmd.env("PCRON_OUTPUT", &f.output);
+    }
+    cmd.stdin(Stdio::null());
+    match ctx.output {
+        Output::Log => cmd.stdout(Stdio::piped()).stderr(Stdio::piped()),
+        Output::Discard => cmd.stdout(Stdio::null()).stderr(Stdio::null()),
+    };
+    // own process group, so that signals reach whatever the script started too
+    cmd.process_group(0);
+
+    let spawned = cmd.spawn().map_err(|e| e.to_string()).and_then(|proc| {
+        let pid = proc.id().ok_or("it exited before it got a pid")?;
+        Ok((proc, pid))
+    });
+    let (proc, pid) = match spawned {
+        Ok(spawned) => spawned,
+        Err(e) => {
+            log_cmd(
+                &job.label,
+                &format!("{prefix}_ERROR(cannot spawn `{}`: {e})", job.shell),
+            );
+            if failure.is_none() {
+                let failure = Failure {
+                    reason: "spawn",
+                    exit: None,
+                    signal: None,
+                    output: e,
+                };
+                on_failure(job, failure, ctx);
+            }
+            return;
+        }
+    };
+    // registered before any await, so that an abort cannot leave it untracked
+    ctx.children.insert(pid);
+    log_cmd(&job.label, &format!("{prefix}_START(pid={pid})"));
+
+    // not part of the loop task: a reload that stops the loop lets the script finish
+    let hook = failure.is_some();
+    tokio::spawn(watch_child(proc, pid, job.clone(), hook, ctx.clone()));
+}
+
+// not while shutting down: the scripts it stops are not failures
+fn on_failure(job: &Arc<Job>, failure: Failure, ctx: &Arc<Ctx>) {
+    if *ctx.phase.borrow() == Phase::Running {
+        start(job, Some(failure), ctx);
+    }
+}
+
 // logs its output and its end, and stops it: SIGTERM after PCRON_TIMEOUT and SIGKILL
 // PCRON_SHUTDOWN_TIMEOUT later; on shutdown, SIGTERM right away and SIGKILL after the
-// shorter of PCRON_SHUTDOWN_TIMEOUT and what is left of its PCRON_TIMEOUT
-async fn watch_child(
-    mut proc: Child,
-    pid: u32,
-    log_script: String,
-    settings: Settings,
-    ctx: Arc<Ctx>,
-) {
+// shorter of PCRON_SHUTDOWN_TIMEOUT and what is left of its PCRON_TIMEOUT. A failed script
+// (but not a failed hook) runs its PCRON_ON_FAILURE.
+async fn watch_child(mut proc: Child, pid: u32, job: Arc<Job>, hook: bool, ctx: Arc<Ctx>) {
+    let prefix = if hook { "HOOK" } else { "CMD" };
+    let tail = Arc::new(Mutex::new(VecDeque::new()));
     let mut readers = JoinSet::new();
     if let Some(out) = proc.stdout.take() {
-        readers.spawn(forward_lines(out, "CMD_OUT", pid, log_script.clone()));
+        let kind = format!("{prefix}_OUT");
+        readers.spawn(forward_lines(
+            out,
+            kind,
+            pid,
+            job.label.clone(),
+            tail.clone(),
+        ));
     }
     if let Some(err) = proc.stderr.take() {
-        readers.spawn(forward_lines(err, "CMD_ERR", pid, log_script.clone()));
+        let kind = format!("{prefix}_ERR");
+        readers.spawn(forward_lines(
+            err,
+            kind,
+            pid,
+            job.label.clone(),
+            tail.clone(),
+        ));
     }
 
+    let settings = &job.settings;
     let timeout_at = settings.timeout.map(|t| Instant::now() + t);
     let mut kill_at: Option<Instant> = None;
     let mut asked = false;
+    let mut timed_out = false;
     let mut phase = ctx.phase.subscribe();
     // it may have started while already shutting down
     phase.mark_changed();
@@ -352,13 +471,14 @@ async fn watch_child(
         tokio::select! {
             status = proc.wait() => break status,
             () = sleep_until_some(timeout_at), if !asked => {
-                log_cmd(&log_script, &format!("CMD_TIMEOUT(pid={pid})"));
+                log_cmd(&job.label, &format!("{prefix}_TIMEOUT(pid={pid})"));
                 signal_group(pid, libc::SIGTERM);
                 asked = true;
+                timed_out = true;
                 kill_at = earliest(kill_at, Some(Instant::now() + settings.shutdown_timeout));
             }
             () = sleep_until_some(kill_at) => {
-                log_cmd(&log_script, &format!("CMD_KILL(pid={pid})"));
+                log_cmd(&job.label, &format!("{prefix}_KILL(pid={pid})"));
                 signal_group(pid, libc::SIGKILL);
                 kill_at = None;
             }
@@ -377,19 +497,53 @@ async fn watch_child(
         }
     };
 
-    let msg = match status {
-        Ok(status) => format!("CMD_END(pid={pid}, {})", fmt_status(status)),
-        Err(e) => format!("CMD_ERROR(pid={pid}, cannot wait: {e})"),
-    };
     // let the readers drain what is left; something the script left in the background
     // may keep the pipes open, so don't wait for it forever
     let _ = timeout(Duration::from_secs(1), readers.join_all()).await;
-    log_cmd(&log_script, &msg);
+    let failure = match &status {
+        Ok(status) => {
+            log_cmd(
+                &job.label,
+                &format!("{prefix}_END(pid={pid}, {})", fmt_status(*status)),
+            );
+            let reason = if timed_out {
+                Some("timeout")
+            } else if status.success() {
+                None
+            } else if status.code().is_some() {
+                Some("exit")
+            } else {
+                Some("signal")
+            };
+            reason.map(|reason| Failure {
+                reason,
+                exit: status.code(),
+                signal: status.signal(),
+                output: Vec::from(tail.lock().unwrap().clone()).join("\n"),
+            })
+        }
+        Err(e) => {
+            log_cmd(
+                &job.label,
+                &format!("{prefix}_ERROR(pid={pid}, cannot wait: {e})"),
+            );
+            None
+        }
+    };
 
     ctx.children.remove(pid);
+    if let (Some(failure), false) = (failure, hook) {
+        on_failure(&job, failure, &ctx);
+    }
 }
 
-async fn forward_lines(r: impl AsyncRead + Unpin, kind: &str, pid: u32, log_script: String) {
+async fn forward_lines(
+    r: impl AsyncRead + Unpin,
+    kind: String,
+    pid: u32,
+    label: String,
+    tail: Arc<Mutex<VecDeque<String>>>,
+) {
     let mut r = BufReader::new(r);
     let mut line = Vec::new();
     loop {
@@ -411,7 +565,13 @@ async fn forward_lines(r: impl AsyncRead + Unpin, kind: &str, pid: u32, log_scri
         let text = String::from_utf8_lossy(&line);
         let text = text.trim_end_matches(['\n', '\r']);
         let mark = if cut { " …" } else { "" };
-        log_cmd(&log_script, &format!("{kind}(pid={pid}) {text}{mark}"));
+        log_cmd(&label, &format!("{kind}(pid={pid}) {text}{mark}"));
+
+        let mut tail = tail.lock().unwrap();
+        if tail.len() == TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(format!("{text}{mark}"));
     }
 }
 
@@ -540,27 +700,29 @@ mod tests {
             output: Output::Discard,
             children: Children::default(),
             phase: watch::Sender::new(Phase::Running),
+            timers: Arc::default(),
         });
+        let sync = |loops: &mut Loops, tab| loops.sync(cmds(tab), &ctx, &mut Saved::new());
         let mut loops = Loops::default();
 
-        let s = loops.sync(cmds("1 $ a\n2 $ b\n1 $ a"), &ctx);
+        let s = sync(&mut loops, "1 $ a\n2 $ b\n1 $ a");
         assert_eq!((s.kept, s.started, s.stopped), (0, 3, 0));
 
         // reordered and rewritten (2 == 4/2) commands keep their loop; one `a` goes
         // away, `c` is new, and `a` with another distribution is a different command
-        let s = loops.sync(cmds("4/2 $ b\n( 1 ) $ a\n1 $ c\n3 $ a"), &ctx);
+        let s = sync(&mut loops, "4/2 $ b\n( 1 ) $ a\n1 $ c\n3 $ a");
         assert_eq!((s.kept, s.started, s.stopped), (2, 2, 1));
         assert_eq!(loops.by_key.values().map(Vec::len).sum::<usize>(), 4);
 
-        let s = loops.sync(cmds("1 $ c"), &ctx);
+        let s = sync(&mut loops, "1 $ c");
         assert_eq!((s.kept, s.started, s.stopped), (1, 0, 3));
 
         // the same command with another environment is a different command
-        let s = loops.sync(cmds("X=1\n1 $ c"), &ctx);
+        let s = sync(&mut loops, "X=1\n1 $ c");
         assert_eq!((s.kept, s.started, s.stopped), (0, 1, 1));
 
         // and so are a name or a window
-        let s = loops.sync(cmds("X=1\nc: 1 $ c\nX=1\n1 @ 9-18 $ c"), &ctx);
+        let s = sync(&mut loops, "X=1\nc: 1 $ c\nX=1\n1 @ 9-18 $ c");
         assert_eq!((s.kept, s.started, s.stopped), (0, 2, 1));
     }
 }

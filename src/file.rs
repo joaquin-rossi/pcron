@@ -1,18 +1,23 @@
 pub mod lexer;
 pub mod parser;
 
-use crate::{Delay, DelayBounds, DistFloat, Settings, Tab, TabCmd, window::Window};
+use crate::{
+    Delay, DelayBounds, DistFloat, Settings, Tab, TabCmd,
+    window::{Window, Zone},
+};
 use parser::Expr;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::{collections::HashMap, fs, path::Path, time::Duration};
 
 /// the variables of the tab that configure pcron instead of the scripts
-pub const SETTINGS: [&str; 4] = [
+pub const SETTINGS: [&str; 6] = [
     "PCRON_MIN_DELAY",
     "PCRON_MAX_DELAY",
     "PCRON_TIMEOUT",
     "PCRON_SHUTDOWN_TIMEOUT",
+    "PCRON_TZ",
+    "PCRON_ON_FAILURE",
 ];
 
 pub fn read(path: impl AsRef<Path>) -> Result<Tab> {
@@ -75,21 +80,30 @@ fn settings(env: &[(String, String)]) -> Result<Settings> {
     let mut settings = Settings::default();
     let (mut min, mut max) = (settings.bounds.min, settings.bounds.max);
     for (name, value) in env.iter().filter(|(name, _)| name.starts_with("PCRON_")) {
-        let secs = seconds(value).with_context(|| format!("in `{name}={value}`"))?;
+        let in_setting = || format!("in `{name}={value}`");
+        let secs = || seconds(value).with_context(in_setting);
         let duration = |secs: f64| {
-            Duration::try_from_secs_f64(secs).map_err(|_| anyhow!("in `{name}={value}`: too long"))
+            Duration::try_from_secs_f64(secs).map_err(|_| anyhow!("{}: too long", in_setting()))
         };
+        let text = value.trim();
         match name.as_str() {
-            "PCRON_MIN_DELAY" => min = secs.unwrap_or(min),
-            "PCRON_MAX_DELAY" => max = secs.unwrap_or(max),
+            "PCRON_MIN_DELAY" => min = secs()?.unwrap_or(min),
+            "PCRON_MAX_DELAY" => max = secs()?.unwrap_or(max),
             // 0 means no limit too
             "PCRON_TIMEOUT" => {
-                settings.timeout = secs.filter(|&s| s > 0.0).map(duration).transpose()?;
+                settings.timeout = secs()?.filter(|&s| s > 0.0).map(duration).transpose()?;
             }
             "PCRON_SHUTDOWN_TIMEOUT" => {
-                if let Some(secs) = secs {
+                if let Some(secs) = secs()? {
                     settings.shutdown_timeout = duration(secs)?;
                 }
+            }
+            "PCRON_TZ" if text.is_empty() => settings.tz = Zone::Local,
+            "PCRON_TZ" => {
+                settings.tz = Zone::parse(text).map_err(|e| anyhow!("{}: {e}", in_setting()))?;
+            }
+            "PCRON_ON_FAILURE" => {
+                settings.on_failure = Some(text.to_string()).filter(|t| !t.is_empty());
             }
             _ => bail!(
                 "unknown setting `{name}` (the PCRON_ ones are {})",
@@ -434,7 +448,7 @@ PCRON_SHUTDOWN_TIMEOUT=3
 1 $ z",
         )
         .unwrap();
-        let s: Vec<_> = tab.cmds.iter().map(|c| c.settings).collect();
+        let s: Vec<_> = tab.cmds.iter().map(|c| c.settings.clone()).collect();
         assert_eq!(s[0], Settings::default());
         assert_eq!(s[1].bounds.min, 0.5);
         assert_eq!(s[1].timeout, Some(Duration::from_secs(120)));
@@ -450,6 +464,33 @@ PCRON_SHUTDOWN_TIMEOUT=3
         assert!(
             err("PCRON_MIN_DELAY=9\nPCRON_MAX_DELAY=5\n\n1 $ x")
                 .contains("line 4: PCRON_MAX_DELAY must be")
+        );
+    }
+
+    #[test]
+    fn text_settings() {
+        let tab = parse(
+            "\
+PCRON_TZ=Europe/Madrid
+PCRON_ON_FAILURE=notify-send \"$PCRON_NAME failed\"
+1 $ x
+PCRON_TZ=
+PCRON_ON_FAILURE=
+1 $ y",
+        )
+        .unwrap();
+        let (a, b) = (&tab.cmds[0].settings, &tab.cmds[1].settings);
+        assert_eq!(a.tz.to_string(), "Europe/Madrid");
+        assert_eq!(
+            a.on_failure.as_deref(),
+            Some("notify-send \"$PCRON_NAME failed\"")
+        );
+        assert_eq!((b.tz, b.on_failure.as_deref()), (Zone::Local, None));
+
+        let err = format!("{:#}", parse("PCRON_TZ=Nowhere\n1 $ x").err().unwrap());
+        assert!(
+            err.contains("in `PCRON_TZ=Nowhere`: unknown time zone"),
+            "{err}"
         );
     }
 

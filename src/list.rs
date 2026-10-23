@@ -1,23 +1,40 @@
 use anyhow::Result;
+use chrono::{DateTime, TimeDelta, Utc};
 use clap::Args;
 use rand::{SeedableRng, rngs::StdRng};
 use serde::Serialize;
 use std::{collections::BTreeMap, path::Path};
 
-use pcron::{Delay, DelayBounds, Settings, TabCmd, file, window::Window};
+use crate::state::{self, CmdKey};
+use pcron::{
+    Delay, DelayBounds, Settings, TabCmd, file, schedule,
+    window::{Window, Zone},
+};
 
 const SAMPLES: usize = 10_000;
 const SCRIPT_WIDTH: usize = 30;
+// for --simulate: shown in the table, and computed per command
+const SHOWN_RUNS: usize = 1000;
+const MAX_RUNS: usize = 100_000;
 
 #[derive(Args, Debug)]
 pub struct ListArgs {
     /// Print as JSON (with the full scripts and unrounded numbers)
     #[arg(long)]
     json: bool,
+
+    /// Instead of the statistics, the runs of the next DURATION (like 90m, 12h or 7d),
+    /// starting from the timers of the server
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    simulate: Option<f64>,
 }
 
 pub fn main_list(tab_path: &Path, args: &ListArgs) -> Result<()> {
     let tab = file::read(tab_path)?;
+    if let Some(secs) = args.simulate {
+        return simulate(tab_path, &tab.cmds, secs, args.json);
+    }
+
     let stats: Vec<_> = tab
         .cmds
         .iter()
@@ -59,15 +76,20 @@ struct JsonSettings {
     max_delay: f64,
     timeout: Option<f64>,
     shutdown_timeout: f64,
+    /// `local`, or a name like Europe/Madrid
+    tz: String,
+    on_failure: Option<String>,
 }
 
-impl From<Settings> for JsonSettings {
-    fn from(s: Settings) -> Self {
+impl From<&Settings> for JsonSettings {
+    fn from(s: &Settings) -> Self {
         Self {
             min_delay: s.bounds.min,
             max_delay: s.bounds.max,
             timeout: s.timeout.map(|t| t.as_secs_f64()),
             shutdown_timeout: s.shutdown_timeout.as_secs_f64(),
+            tz: s.tz.to_string(),
+            on_failure: s.on_failure.clone(),
         }
     }
 }
@@ -90,7 +112,7 @@ fn print_json(cmds: &[TabCmd], stats: &[Stats]) -> Result<()> {
                     .filter(|(k, _)| !file::SETTINGS.contains(&k.as_str()))
                     .map(|(k, v)| (k.as_str(), v.as_str()))
                     .collect(),
-                settings: cmd.settings.into(),
+                settings: (&cmd.settings).into(),
                 delay,
             })
             .collect(),
@@ -145,7 +167,10 @@ fn row(cmd: &TabCmd, s: &Stats) -> Vec<String> {
         cmd.delay.display_with(&fmt_num),
         cmd.window
             .as_ref()
-            .map(Window::to_string)
+            .map(|w| match cmd.settings.tz {
+                Zone::Local => w.to_string(),
+                tz => format!("{w} ({tz})"),
+            })
             .unwrap_or_default(),
         cmd.settings
             .timeout
@@ -163,6 +188,117 @@ fn row(cmd: &TabCmd, s: &Stats) -> Vec<String> {
         },
         format!("{}%", fmt_num(s.clamped * 100.0)),
     ]
+}
+
+// the runs of every command until `secs` from now, as the server would do them: from its
+// saved timers if it has them (one that is due runs right away), and then sampling
+fn simulate(tab_path: &Path, cmds: &[TabCmd], secs: f64, json: bool) -> Result<()> {
+    let now = Utc::now();
+    let end = now + TimeDelta::microseconds((secs * 1e6) as i64);
+    let mut saved = state::path(tab_path)
+        .and_then(|path| state::load(&path).ok())
+        .unwrap_or_default();
+    // fixed seed, like the statistics
+    let mut rng = StdRng::seed_from_u64(0);
+
+    let mut runs: Vec<(DateTime<Utc>, &TabCmd)> = Vec::new();
+    for cmd in cmds {
+        let mut at = match saved.get_mut(&CmdKey::new(cmd)).and_then(Vec::pop) {
+            Some(at) => schedule::open_at(cmd, at.max(now)),
+            None => schedule::next_run(cmd, now, &mut rng).1,
+        };
+        // a delay of 0 never gets anywhere, hence the limit
+        for _ in 0..MAX_RUNS {
+            if at >= end {
+                break;
+            }
+            runs.push((at, cmd));
+            at = schedule::next_run(cmd, at, &mut rng).1;
+        }
+    }
+    runs.sort_by_key(|&(at, cmd)| (at, cmd.line));
+
+    if json {
+        #[derive(Serialize)]
+        struct JsonRun<'a> {
+            time: String,
+            line: usize,
+            name: Option<&'a str>,
+            script: &'a str,
+        }
+        #[derive(Serialize)]
+        struct JsonSimulation<'a> {
+            from: String,
+            until: String,
+            runs: Vec<JsonRun<'a>>,
+        }
+        let simulation = JsonSimulation {
+            from: now.to_rfc3339(),
+            until: end.to_rfc3339(),
+            runs: runs
+                .iter()
+                .map(|&(at, cmd)| JsonRun {
+                    time: at.with_timezone(&chrono::Local).to_rfc3339(),
+                    line: cmd.line,
+                    name: cmd.name.as_deref(),
+                    script: &cmd.script,
+                })
+                .collect(),
+        };
+        println!("{}", serde_json::to_string_pretty(&simulation)?);
+        return Ok(());
+    }
+
+    let header = ["TIME", "LINE", "NAME", "SCRIPT"]
+        .map(String::from)
+        .to_vec();
+    let rows = runs.iter().take(SHOWN_RUNS).map(|&(at, cmd)| {
+        vec![
+            at.with_timezone(&chrono::Local)
+                .format("%a %b %d %H:%M:%S")
+                .to_string(),
+            cmd.line.to_string(),
+            cmd.name.clone().unwrap_or_default(),
+            script_preview(&cmd.script),
+        ]
+    });
+    let table: Vec<_> = std::iter::once(header).chain(rows).collect();
+    print!("{}", render(&table, &[true, false, true, true]));
+
+    let shown = if runs.len() > SHOWN_RUNS {
+        format!(" (showing the first {SHOWN_RUNS})")
+    } else {
+        String::new()
+    };
+    println!(
+        "\n{} runs in the next {}{shown}",
+        runs.len(),
+        fmt_duration(secs)
+    );
+    Ok(())
+}
+
+// 90, 90s, 15m, 12h, 7d or 2w, in seconds
+fn parse_duration(text: &str) -> Result<f64, String> {
+    let err = || format!("`{text}` is not a duration (use something like 90m, 12h or 7d)");
+    let split = text
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().map_err(|_| err())?;
+    let unit = match unit {
+        "" | "s" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        "d" => 86400.0,
+        "w" => 7.0 * 86400.0,
+        _ => return Err(err()),
+    };
+    let secs = number * unit;
+    if !(secs.is_finite() && secs > 0.0) {
+        return Err(err());
+    }
+    Ok(secs)
 }
 
 /// statistics of the actual delay (after applying the bounds), estimated by sampling; with a
@@ -334,6 +470,16 @@ mod tests {
             cmd.window.as_ref(),
             DelayBounds::new(1.0, 100.0).unwrap(),
         )
+    }
+
+    #[test]
+    fn durations_to_simulate() {
+        assert_eq!(parse_duration("90"), Ok(90.0));
+        assert_eq!(parse_duration("1.5h"), Ok(5400.0));
+        assert_eq!(parse_duration("7d"), Ok(7.0 * 86400.0));
+        for bad in ["", "d", "7y", "-1h", "0"] {
+            assert!(parse_duration(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

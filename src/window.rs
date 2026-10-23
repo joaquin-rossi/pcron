@@ -1,5 +1,58 @@
-use chrono::{Datelike, NaiveDateTime, TimeDelta, Timelike};
+use chrono::{DateTime, Datelike, LocalResult, NaiveDateTime, TimeDelta, TimeZone, Timelike, Utc};
 use std::fmt;
+
+/// the time zone of windows (PCRON_TZ)
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Zone {
+    #[default]
+    Local,
+    Tz(chrono_tz::Tz),
+}
+
+impl Zone {
+    pub fn parse(name: &str) -> Result<Self, String> {
+        name.parse().map(Zone::Tz).map_err(|_| {
+            format!("unknown time zone `{name}` (use names like America/Argentina/Buenos_Aires)")
+        })
+    }
+
+    /// the wall-clock time of `t` in this zone
+    pub fn naive(self, t: DateTime<Utc>) -> NaiveDateTime {
+        match self {
+            Zone::Local => t.with_timezone(&chrono::Local).naive_local(),
+            Zone::Tz(tz) => t.with_timezone(&tz).naive_local(),
+        }
+    }
+
+    /// when the wall clock of this zone shows `t`
+    pub fn utc(self, t: NaiveDateTime) -> DateTime<Utc> {
+        match self {
+            Zone::Local => to_utc(&chrono::Local, t),
+            Zone::Tz(tz) => to_utc(&tz, t),
+        }
+    }
+}
+
+// when the clocks go back, the first of the two moments; when they go forward (and `t`
+// never happens), an hour later
+fn to_utc<Z: TimeZone>(zone: &Z, t: NaiveDateTime) -> DateTime<Utc> {
+    match zone.from_local_datetime(&t) {
+        LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => t.to_utc(),
+        LocalResult::None => zone
+            .from_local_datetime(&(t + TimeDelta::hours(1)))
+            .earliest()
+            .map_or_else(|| t.and_utc(), |t| t.to_utc()),
+    }
+}
+
+impl fmt::Display for Zone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Zone::Local => f.write_str("local"),
+            Zone::Tz(tz) => f.write_str(tz.name()),
+        }
+    }
+}
 
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 const DAY_MINUTES: u32 = 24 * 60;
@@ -237,6 +290,28 @@ mod tests {
         assert!(w.contains(at(5, 23, 0)));
         assert!(w.contains(at(5, 1, 0)));
         assert!(!w.contains(at(6, 1, 0)));
+    }
+
+    #[test]
+    fn zones() {
+        let tz = Zone::parse("America/Argentina/Buenos_Aires").unwrap();
+        let t = at(5, 12, 0);
+        // UTC-3 all year
+        assert_eq!(tz.utc(t), t.and_utc() + TimeDelta::hours(3));
+        assert_eq!(tz.naive(tz.utc(t)), t);
+        assert!(
+            Zone::parse("Mars/Olympus_Mons")
+                .unwrap_err()
+                .contains("unknown time zone")
+        );
+
+        // 2024-03-10 02:30 does not happen in New York (clocks go from 2:00 to 3:00)
+        let ny = Zone::parse("America/New_York").unwrap();
+        let gap = NaiveDate::from_ymd_opt(2024, 3, 10)
+            .unwrap()
+            .and_hms_opt(2, 30, 0)
+            .unwrap();
+        assert_eq!(ny.naive(ny.utc(gap)), gap + TimeDelta::hours(1));
     }
 
     #[test]
